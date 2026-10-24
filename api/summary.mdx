@@ -23,7 +23,7 @@ This endpoint takes no query parameters.
       Total number of device profiles in the `dispositivos` table.
     </ResponseField>
     <ResponseField name="lista_negra_activa" type="integer">
-      Number of currently **active** entries in the `lista_negra` table (i.e. rows where `activa = true` and `fecha_alta <= current_date`). Inactive or future-dated entries are not counted.
+      Number of currently **active** entries in the `lista_negra` table (i.e. rows where `activa = true`). Inactive entries are not counted.
     </ResponseField>
     <ResponseField name="transacciones" type="integer">
       Total historical transaction records loaded into the `transacciones` table (used for user and device profiling).

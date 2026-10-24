@@ -1,7 +1,7 @@
 ---
-title: "API Gateway: Nginx Routing, Rate Limiting, and Load Balancing"
+title: "API Gateway: Nginx Routing, Rate Limiting, Failover"
 sidebarTitle: "Gateway"
-description: "The Guardián Centinela Nginx gateway routes traffic to three upstreams, enforces a 400 req/s rate limit, and distributes inference load across two IA replicas with automatic failover."
+description: "The Nginx gateway routes traffic to three upstreams, enforces a 400 req/s rate limit, and distributes load across two IA replicas with automatic failover."
 ---
 
 The gateway (`servicio-gateway`) is the single public entry point for the entire Guardián Centinela system. It is the **only** container that exposes a host port (`8080`). Every other service — dominio, IA replicas, and the front-end — lives exclusively on the internal Docker network and is unreachable from outside. All routing, rate limiting, load balancing, and error normalization happen here before a single byte reaches a business service.

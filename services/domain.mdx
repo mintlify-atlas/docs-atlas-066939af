@@ -1,7 +1,7 @@
 ---
-title: "Domain Service: Fraud Evaluation Business Logic"
+title: "Domain Service: Transaction Fraud Evaluation Logic"
 sidebarTitle: "Domain Service"
-description: "The domain service is the only component that reads and writes the database. It validates input, enriches transactions with user and device profiles, calls the inference service, and records every decision."
+description: "The domain service validates, enriches, and scores transactions, applies a fallback policy when inference is unavailable, and persists every decision."
 ---
 
 The domain service (`servicio-dominio`) is the orchestration layer of Guardián Centinela. It is the **only** component in the system that holds a connection pool to PostgreSQL. All other services are stateless and have no database credentials. When a transaction arrives, the domain service validates it, enriches it with data from the database, calls the inference microservice, applies a fallback policy if the inference service is unavailable, and writes a permanent audit record before returning a response.
@@ -189,6 +189,16 @@ Beyond `/evaluar`, the domain service exposes several read-only endpoints useful
 | `GET /predicciones/{transaccion_id}` | Full audit trail for a specific transaction (RF7) |
 | `GET /usuarios` | Sample users with a known device and merchant (for the demo front-end) |
 | `GET /resumen` | Row counts per table and decision breakdown by origin |
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://kipu:kipu@db:5432/kipu` | PostgreSQL connection string |
+| `IA_URL` | `http://gateway:8080/api/ia` | Base URL for the inference service (via gateway for load balancing) |
+| `IA_TIMEOUT_MS` | `500` | Inference call deadline in milliseconds |
+| `POLITICA_RESERVA` | `reglas` | Fallback policy when the inference service is unavailable: `reglas`, `aprobar`, or `bloquear` |
+| `DB_POOL_MAX` | `8` | Maximum connections in the `psycopg_pool` connection pool |
 
 ## Resource limits
 

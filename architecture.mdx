@@ -1,7 +1,7 @@
 ---
 title: "Guardián Centinela System Architecture and Service Design"
 sidebarTitle: "Architecture"
-description: "Five-service Docker Compose architecture: nginx gateway, domain API, two inference replicas, data loader, and PostgreSQL — with health checks, rate limiting, and round-robin load balancing."
+description: "Six-service Docker Compose stack: nginx gateway, domain API, two IA replicas, and PostgreSQL — rate-limited at 400 r/s with round-robin load balancing."
 ---
 
 Guardián Centinela runs as a Docker Compose application named `kipu-guardian-centinela`. All services communicate over a single internal bridge network called `interna`. The nginx gateway is the **only** service that publishes a port to the host — everything else is unreachable from outside the Docker network by design. This means the entire system presents a single attack surface at port 8080.
@@ -12,7 +12,7 @@ Guardián Centinela runs as a Docker Compose application named `kipu-guardian-ce
 
 ## Services at a Glance
 
-The stack consists of six containers (five logical services, with the inference service scaled to two replicas):
+The stack consists of seven containers (six logical services, with the inference service scaled to two replicas):
 
 <CardGroup cols={2}>
   <Card title="gateway" icon="shield-halved">

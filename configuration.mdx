@@ -117,6 +117,17 @@ Maximum number of connections in the psycopg3 connection pool maintained by the 
 
 ---
 
+#### `ROOT_PATH`
+
+| | |
+|---|---|
+| **Default** | `""` (empty string) |
+| **Used by** | `dominio` |
+
+ASGI root path passed to the FastAPI constructor (`root_path=os.getenv("ROOT_PATH", "")`). Set this when the domain service is mounted behind a reverse proxy or sub-path (for example `ROOT_PATH=/api/dominio`) so that the OpenAPI schema and `Location` headers generate correct absolute URLs. Leave empty — the default — when using the provided `compose.yaml` setup where the gateway handles path rewriting before forwarding to `dominio`.
+
+---
+
 ### IA service — `servicio-ia`
 
 #### `ORT_THREADS`

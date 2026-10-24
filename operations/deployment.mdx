@@ -124,16 +124,18 @@ The `depends_on` conditions in `compose.yaml` enforce a strict startup order:
 db (pg_isready healthy)
   └─► carga (completes_successfully, exit 0)
         └─► dominio (healthcheck: /health → 200)
-        └─► ia     (healthcheck: /health → 200, start_period 20s)
-              └─► front   (healthcheck: /health → 200)
-              └─► gateway (healthcheck: /health → 200)
+
+ia    (healthcheck: /health → 200, start_period 20s)   ← no depends_on
+front (healthcheck: /health → 200)                     ← no depends_on
+
+gateway (depends_on: front healthy, dominio healthy, ia healthy)
 ```
 
 **Key details:**
 
 - **`db`** uses `pg_isready -U kipu -d kipu` with a 5-second interval and up to 10 retries (50 s maximum wait). The PostgreSQL data directory is initialized on the first start from the `datos-pg` named volume.
-- **`carga`** is a one-shot container (`restart: "no"`). It runs `carga.py`, seeds reference tables using `ON CONFLICT DO NOTHING` (making it safe to run multiple times), then exits with code `0`. Both `dominio` and `ia` declare `condition: service_completed_successfully` on `carga`, so neither starts until this seed finishes.
-- **`dominio`** and **`ia`** start in parallel once `carga` completes. Each has a `start_period` (10 s for `dominio`, 20 s for `ia`) to load models or warm up connection pools before healthchecks begin.
+- **`carga`** is a one-shot container (`restart: "no"`). It runs `carga.py`, seeds reference tables using `ON CONFLICT DO NOTHING` (making it safe to run multiple times), then exits with code `0`. `dominio` declares `condition: service_completed_successfully` on `carga`, so it does not start until the seed finishes.
+- **`dominio`** starts once `carga` completes and has a `start_period` of 10 s to warm up its connection pool before healthchecks begin. **`ia`** has no `depends_on` in `compose.yaml` — it starts independently (in parallel with `db`, `carga`, `front`, and others) and has a `start_period` of 20 s because TensorFlow model loading is the slowest initialization step.
 - **`gateway`** starts only after `front`, `dominio`, and `ia` are all healthy — ensuring the nginx upstream pool is complete before any traffic is accepted.
 
 ## Data persistence: the `datos-pg` volume

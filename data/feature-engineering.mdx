@@ -1,7 +1,7 @@
 ---
 title: "Feature Engineering: 21 Variables for Fraud Detection"
 sidebarTitle: "Feature Engineering"
-description: "The 21 numeric and categorical features engineered by construir_variables() in preparar.py, with their source columns, calculation logic, and the columns excluded to prevent data leakage."
+description: "The 21 fraud detection features (15 numeric, 6 categorical) from construir_variables() in preparar.py: sources, calculations, and leakage exclusions."
 ---
 
 All 21 model features are calculated by `construir_variables()` in `datos/preparar.py`. This function is **shared with the inference service** — it is not duplicated. When a payment arrives at the API, the same function processes it in real time using the same logic that produced the training data. There is no training/serving skew by construction.
@@ -43,7 +43,7 @@ All 21 model features are calculated by `construir_variables()` in `datos/prepar
 
 `construir_variables()` joins the three normalized tables with left joins, anchored on transactions:
 
-```
+```sql
 transactions
   LEFT JOIN usuarios ON usuario_id
   LEFT JOIN dispositivos ON dispositivo_id

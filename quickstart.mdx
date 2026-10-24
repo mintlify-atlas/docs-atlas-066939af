@@ -1,5 +1,5 @@
 ---
-title: "Get Started with Guardián Centinela in Minutes"
+title: "Get Started with Guardián Centinela Fraud Detection"
 sidebarTitle: "Quickstart"
 description: "Deploy the full Guardián Centinela fraud detection stack locally using Docker Compose and evaluate your first transaction in under five minutes."
 ---
@@ -52,10 +52,10 @@ docker compose -p equipoNN up -d
 
 Docker Compose respects the `depends_on` conditions declared in `compose.yaml`, so services start in this order:
 
-1. **`db`** — PostgreSQL 16 starts first; healthcheck polls `pg_isready` every 5 s.
-2. **`carga`** — runs once the database is healthy; seeds users, devices, and the block-list, then exits with code 0.
-3. **`dominio`** and **`ia`** — start in parallel once both `db` is healthy and `carga` has completed successfully.
-4. **`front`** and **`gateway`** — come up last, after `dominio` and `ia` are healthy.
+1. **`db`**, **`ia`**, and **`front`** — start immediately with no prerequisites; `db` healthcheck polls `pg_isready` every 5 s.
+2. **`carga`** — starts once `db` is healthy; seeds users, devices, and the block-list, then exits with code 0.
+3. **`dominio`** — starts once `db` is healthy **and** `carga` has completed successfully.
+4. **`gateway`** — starts last, once `front`, `dominio`, and `ia` are all healthy.
 
 <Tip>
 The `carga` service is designed to run exactly once and exit normally. Docker Compose will show its status as **`Exited (0)`** — this is expected and not an error. Its seed queries use `ON CONFLICT DO NOTHING`, so restarting the stack never duplicates data.
@@ -71,7 +71,7 @@ docker compose -p equipoNN ps
 
 A fully ready stack looks like this:
 
-```
+```text
 NAME                          IMAGE                                          STATUS
 equipoNN-db-1                 postgres:16-alpine                             Up 30s (healthy)
 equipoNN-carga-1              ghcr.io/ser-martinezs/servicio-carga:ep2       Exited (0)
@@ -167,7 +167,11 @@ A successful evaluation returns a JSON object like this:
 | `probabilidad_fraude` | float | Calibrated fraud probability from the ONNX model (0–1) |
 | `razones` | array | Top-3 feature contributions from the model, plus any block-list or fallback entries |
 | `version_modelo` | string | Model artefact version that produced this decision |
+| `version_umbrales` | string | Threshold configuration version applied to the raw score |
+| `usuario_conocido` | boolean | `true` if the `usuario_id` was found in the database |
 | `latencia_ms` | float | Wall-clock time from request receipt to response |
+| `desglose_ms` | object | Latency breakdown: `base_de_datos` and `ia` sub-timings in ms |
+| `fecha_utc` | string | ISO 8601 timestamp when the decision was persisted (UTC) |
 
 ### Open the dashboard
 

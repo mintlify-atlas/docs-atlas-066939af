@@ -1,7 +1,7 @@
 ---
 title: "Guardián Centinela: Real-Time Fraud Detection for Kipu Pagos"
 sidebarTitle: "Introduction"
-description: "Guardián Centinela scores payment transactions for fraud in real time using a Neural Additive Model, delivering explainable approve/review/block decisions with full audit trail."
+description: "Guardián Centinela scores Kipu Pagos payments for fraud in real time, returning explainable approve/review/block decisions with a permanent audit record."
 ---
 
 Guardián Centinela is the real-time fraud detection system for Kipu Pagos. Every payment transaction is scored within milliseconds, classified into one of three decisions, and permanently recorded for audit — before the funds ever move. The system was purpose-built to handle Kipu Pagos' production volume of approximately **200,000 transactions per day** at a real-world fraud rate of **~0.012%**, where catching each fraudulent transaction matters enormously while keeping false-positive blocks low enough that legitimate customers are never inconvenienced.
@@ -78,7 +78,7 @@ The thresholds are defined in `servicio-ia/calidad.json` and enforced by the tra
     Run Guardián Centinela locally with Docker Compose and send your first evaluation request in under five minutes.
   </Card>
   <Card title="Architecture" icon="diagram-project" href="/architecture">
-    Deep dive into the five-service Docker topology, nginx gateway configuration, and request routing.
+    Deep dive into the six-service Docker topology, nginx gateway configuration, and request routing.
   </Card>
   <Card title="Data Overview" icon="database" href="/data/overview">
     Understand how training data is prepared, split, and weighted to reflect real production fraud rates.

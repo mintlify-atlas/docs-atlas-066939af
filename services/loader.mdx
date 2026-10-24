@@ -1,7 +1,7 @@
 ---
-title: "Data Loader Service: Idempotent Database Seeding"
+title: "Loader Service: Idempotent PostgreSQL Schema Seeding"
 sidebarTitle: "Data Loader"
-description: "The loader service creates the PostgreSQL schema and bulk-loads treated CSV data on first start. It runs once and exits, is idempotent via ON CONFLICT DO NOTHING, and never duplicates rows."
+description: "One-shot job that creates the PostgreSQL schema and bulk-loads treated CSV data via COPY plus ON CONFLICT DO NOTHING. Runs once and never duplicates rows."
 ---
 
 The loader service (`servicio-carga`) is a one-shot job that bootstraps the system database. It creates the full PostgreSQL schema if it does not already exist, then bulk-loads the four reference tables from the treated CSV files produced by `datos/preparar.py`. Once all tables are loaded and the transaction is committed, the process exits with code 0. Docker Compose does not restart it (`restart: "no"`), and the domain service is configured to wait for it to complete successfully before accepting requests.
@@ -65,8 +65,10 @@ The primary user profile table. Each row represents one registered account.
 | `verificado` | `REAL` | 0.0 or 1.0 |
 | `telefono_verificado` | `REAL` | 0.0 or 1.0 |
 | `nivel_kyc` | `REAL` | CHECK: 0–3 |
+| `email_dominio` | `TEXT` | — |
 | `dominio_desechable` | `REAL` | 0.0 or 1.0 |
 | `fecha_registro` | `DATE` | — |
+| `snap_transacciones_previas` | `REAL` | — |
 | `flag_fecha_registro_futura` | `BOOLEAN NOT NULL` | Set by `preparar.py` |
 
 ### `dispositivos`
@@ -81,6 +83,7 @@ One row per unique device. Loaded after `usuarios`.
 | `emulador` | `REAL` | 0.0 or 1.0 |
 | `sistema_operativo` | `TEXT` | — |
 | `primera_vez_utc` | `TIMESTAMPTZ` | — |
+| `snap_usuarios_distintos` | `REAL` | — |
 
 ### `lista_negra`
 

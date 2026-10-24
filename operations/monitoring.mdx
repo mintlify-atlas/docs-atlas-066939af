@@ -28,13 +28,19 @@ This endpoint is served directly by nginx without proxying to any upstream. A `2
 curl http://localhost:8080/api/dominio/health
 ```
 
-The domain service tests its PostgreSQL connection on every call to this endpoint. If the database is unreachable, it returns `503`:
+The domain service tests its PostgreSQL connection on every call to this endpoint. A `200` response confirms that the business logic layer and its persistence store are both operational:
 
 ```json
-{"status": "error", "detalle": "no se puede conectar a la base de datos"}
+{"status": "healthy", "servicio": "servicio-dominio"}
 ```
 
-A `200` response confirms that the business logic layer and its persistence store are both operational.
+If the database is unreachable, FastAPI returns `503` with a detail string:
+
+```json
+{"detail": "base no disponible: OperationalError"}
+```
+
+The detail message includes the exception class name so you can distinguish a connection refusal from a timeout.
 
 ### Inference service health
 
@@ -42,10 +48,10 @@ A `200` response confirms that the business logic layer and its persistence stor
 curl http://localhost:8080/api/ia/health
 ```
 
-The inference service verifies that the TensorFlow model is loaded and ready to serve predictions. A healthy response includes the active model version:
+The inference service verifies that the TensorFlow model is loaded and ready to serve predictions. A healthy response includes the service name and the active model version:
 
 ```json
-{"status": "healthy", "version_modelo": "2.0.0+a3f1b2c"}
+{"status": "healthy", "servicio": "microservicio-ia", "version_modelo": "2.0.0+a3f1b2c"}
 ```
 
 A `503` means the model has not finished loading (typical during the 20-second `start_period`) or failed to initialize. Check container logs if `503` persists beyond startup.
@@ -65,7 +71,7 @@ Every response from `POST /api/dominio/evaluar` includes a latency breakdown so 
   "transaccion_id": "txn_001",
   "decision": "aprobar",
   "probabilidad_fraude": 0.04,
-  "origen": "ia",
+  "origen": "modelo",
   "version_modelo": "2.0.0+a3f1b2c",
   "latencia_ms": 87,
   "desglose_ms": {
@@ -98,14 +104,16 @@ Returns the most recent fraud evaluation decisions stored in the database. Each 
 ```json
 [
   {
+    "prediccion_id": 1042,
     "transaccion_id": "txn_001",
     "usuario_id": "KP301626",
     "decision": "aprobar",
-    "probabilidad_fraude": 0.04,
-    "origen": "ia",
+    "origen": "modelo",
+    "probabilidad": 0.04,
     "version_modelo": "2.0.0+a3f1b2c",
-    "latencia_ms": 87,
-    "timestamp": "2026-10-15T20:00:00Z"
+    "version_umbrales": "2.0.0",
+    "latencia_ms": 87.0,
+    "creado_utc": "2026-10-15T20:00:00+00:00"
   }
 ]
 ```
@@ -114,9 +122,9 @@ The `origen` field is particularly important for operational monitoring:
 
 | `origen` value | Meaning |
 |---|---|
-| `ia` | Decision made by the trained TensorFlow model |
+| `modelo` | Decision made by the trained TensorFlow model |
+| `regla_dura` | A hard rule (e.g., blacklist compliance hit) forced the decision before the model was consulted |
 | `reserva` | IA was unavailable — decision made by the fallback policy (`POLITICA_RESERVA`) |
-| `reglas` | Decision made by the rule-based engine (when configured as primary) |
 
 <Warning>
 When `origen=reserva` appears in decisions, it means the IA service was unreachable or timed out (default timeout: 500 ms, configurable via `IA_TIMEOUT_MS`). A spike in `reserva` decisions should trigger an alert — check IA container logs and healthcheck status immediately.
@@ -132,22 +140,23 @@ Returns an overview of the system state: table row counts and a breakdown of dec
 
 ```json
 {
-  "totales": {
-    "transacciones": 15420,
-    "predicciones": 15420,
+  "tablas": {
     "usuarios": 1200,
-    "comercios": 340
+    "dispositivos": 980,
+    "lista_negra_activa": 42,
+    "transacciones": 15420,
+    "predicciones": 15420
   },
   "decisiones": [
-    {"decision": "aprobar",  "origen": "ia",      "cantidad": 14810},
-    {"decision": "revisar",  "origen": "ia",      "cantidad": 487},
-    {"decision": "bloquear", "origen": "ia",      "cantidad": 98},
-    {"decision": "aprobar",  "origen": "reserva", "cantidad": 25}
+    {"decision": "aprobar",  "origen": "modelo",    "n": 14810},
+    {"decision": "revisar",  "origen": "modelo",    "n": 487},
+    {"decision": "bloquear", "origen": "regla_dura","n": 98},
+    {"decision": "aprobar",  "origen": "reserva",   "n": 25}
   ]
 }
 ```
 
-Use the `decisiones` breakdown to compute model vs. fallback ratios over time. A healthy system should show nearly all decisions with `origen=ia`. The `revisar` to `bloquear` ratio reflects threshold tuning in `servicio-ia/model/umbrales.json`.
+Use the `decisiones` breakdown to compute model vs. fallback ratios over time. A healthy system should show nearly all decisions with `origen=modelo`. The `revisar` to `bloquear` ratio reflects threshold tuning in `servicio-ia/model/umbrales.json`.
 
 ---
 

@@ -1,7 +1,7 @@
 ---
-title: "Inference Service: ONNX NAM Fraud Scoring"
+title: "Inference Service: ONNX Neural Additive Model Scoring"
 sidebarTitle: "Inference Service"
-description: "The inference microservice loads a Neural Additive Model from ONNX, preprocesses transactions using the same logic as training, and returns calibrated fraud probabilities with per-factor explanations."
+description: "Stateless NAM microservice loading ONNX artifacts, applying training-identical transforms, and returning calibrated fraud probabilities with explanations."
 ---
 
 The inference service (`servicio-ia`) is a stateless FastAPI microservice that loads a trained Neural Additive Model (NAM) from an ONNX file and scores incoming transactions in real time. It has **no database connection** — the domain service performs all database reads and forwards the enriched transaction payload. Two replicas run by default, and the Nginx gateway distributes load between them with round-robin balancing and automatic failover.
@@ -48,6 +48,8 @@ The domain service sends a JSON body that matches the following Pydantic model:
 | `canal` | `str` | `app`, `web`, `pos`, or `api` |
 | `pais_transaccion` | `str` | 2-letter ISO country code |
 | `mcc` | number or text | Normalized to a 4-digit string |
+| `latitud` | `float` (optional) | — |
+| `longitud` | `float` (optional) | — |
 | `ip` | `str` (optional) | — |
 | `intentos_previos_1h` | `float` (optional) | Absent = treated as missing by the model |
 | `tarjeta_enmascarada` | `str` (optional) | Never a full PAN |

@@ -105,6 +105,9 @@ The `/evaluar` endpoint is the core of Guardián Centinela. It accepts a payment
     <ResponseField name="descripcion" type="string">
       Human-readable explanation of why this reason applies.
     </ResponseField>
+    <ResponseField name="valor" type="number">
+      *(Model reasons only.)* The observed feature value that triggered this reason (e.g. the raw monto or a derived score).
+    </ResponseField>
     <ResponseField name="aporte_logodds" type="number">
       *(Model reasons only.)* The feature's contribution to the log-odds score. Positive values increase fraud probability.
     </ResponseField>

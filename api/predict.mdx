@@ -1,7 +1,7 @@
 ---
 title: "POST /predict — Raw Inference Endpoint for Fraud Scoring"
 sidebarTitle: "POST /predict"
-description: "POST /api/ia/predict accepts a full TransaccionInput payload, runs the ONNX NAM, and returns a calibrated fraud probability, decision, and per-factor explainability reasons."
+description: "Submits a TransaccionInput to the ONNX inference engine and returns a calibrated fraud probability, three-zone decision, and top explainability factors."
 ---
 
 The `/predict` endpoint is the direct interface to the Neural Additive Model (NAM) inference engine. It accepts a `TransaccionInput` payload assembled by the domain service, runs the ONNX model, applies Platt-scaling calibration, and returns a fraud probability, a three-zone decision, and the top three explainability factors.
@@ -185,7 +185,7 @@ A successful `200 OK` returns a `PrediccionResponse` JSON object.
 
   <Expandable title="RazonExplicabilidad fields">
     <ResponseField name="factor" type="string">
-      Internal feature name (e.g. `"hora_local"`, `"monto_valor"`, `"nivel_kyc"`).
+      Internal feature name (e.g. `"hora_local"`, `"log_monto_usd"`, `"nivel_kyc"`).
     </ResponseField>
 
     <ResponseField name="descripcion" type="string">
@@ -215,7 +215,7 @@ A successful `200 OK` returns a `PrediccionResponse` JSON object.
 </ResponseField>
 
 <ResponseField name="latencia_ms" type="float">
-  End-to-end inference latency in milliseconds, measured from the start of `construir_features` to completion of serialization (e.g. `4.73`).
+  End-to-end inference latency in milliseconds, measured from the start of the `predict()` handler (before feature construction) to the moment the response is returned (e.g. `4.73`). Measured with `time.perf_counter()`.
 </ResponseField>
 
 <ResponseField name="regla_aplicada" type="string | null">
@@ -238,14 +238,14 @@ A successful `200 OK` returns a `PrediccionResponse` JSON object.
 
 The preferred format is **ISO 8601 with an explicit time zone offset**:
 
-```
+```text
 2024-11-20T14:32:05-04:00   ← Chile Standard Time
 2024-11-20T18:32:05Z        ← UTC equivalent
 ```
 
 When no time zone is provided, the service assumes **Chile local time (UTC−4)**. The following zone-naive formats are also accepted:
 
-```
+```text
 2024-11-20 14:32:05         ← space-separated, no zone → treated as Chile time
 20/11/2024 14:32            ← dd/mm/YYYY HH:MM → treated as Chile time
 ```
@@ -260,8 +260,7 @@ Any other format causes a `422` with detail `"timestamp: formato no reconocido"`
 |---|---|---|
 | `1200` (JSON number) | `1200.00` | Dot is always decimal |
 | `45.5` (JSON number) | `45.50` | |
-| `"$1.200"` (string) | `1200.00` | CLP style: dot is thousands separator |
-| `"1.200,00"` (string) | `1200.00` | CLP full form |
+| `"$1.200"` (string) | `1200.00` | CLP style: dot is thousands separator (exactly 3 digits after dot) |
 | `"45,50"` (string) | `45.50` | USD/European style: comma is decimal |
 | `"45.50"` (string) | `45.50` | Plain decimal string |
 
@@ -330,9 +329,9 @@ curl -X POST http://localhost:8080/api/ia/predict \
       "efecto": "baja el riesgo"
     },
     {
-      "factor": "monto_valor",
-      "descripcion": "Aporte del factor monto_valor",
-      "valor": 154990.0,
+      "factor": "log_monto_usd",
+      "descripcion": "Aporte del factor log_monto_usd",
+      "valor": 5.087,
       "aporte_logodds": 0.193,
       "efecto": "sube el riesgo"
     }

@@ -26,7 +26,6 @@ on:
     branches: [dev, main]   # build + test only — never publishes
   push:
     branches: [main]        # build + test + publish sha-<commit> and latest
-  push:
     tags: [ep2]             # re-tag only — no rebuild
 ```
 

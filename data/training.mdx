@@ -1,7 +1,7 @@
 ---
-title: "Train the Fraud Detection Model with entrenar.py"
+title: "Training the Fraud Detection Model with entrenar.py"
 sidebarTitle: "Training"
-description: "How to train, calibrate, and export the Guardián Centinela NAM fraud model using entrenar.py, including the quality gate, Platt calibration, threshold search, and ONNX export."
+description: "Train and export the Guardián Centinela NAM with entrenar.py: quality gate, Platt calibration, threshold search, ONNX export, and full CLI reference."
 ---
 
 `servicio-ia/entrenar.py` takes the treated data produced by `datos/preparar.py` and produces a trained, calibrated, evaluated, and exported fraud model. It never touches raw CSVs — all data decisions live in `preparar.py`. If `entrenar.py` exits with code 0, the CI pipeline proceeds to build the Docker image. Any other exit code blocks the build.
@@ -46,7 +46,7 @@ The subnetworks use two hidden layers (sizes 16 and 8) with ReLU activations and
 
     Training runs in blocks of 10 epochs. After each block the PR-AUC (production-weighted) on the validation set is printed. The model weights at the best validation PR-AUC across all blocks are retained:
 
-    ```
+    ```text
        época  10 · PR-AUC (producción) en validación 0.312
        época  20 · PR-AUC (producción) en validación 0.381
        ...
@@ -61,7 +61,7 @@ The subnetworks use two hidden layers (sizes 16 and 8) with ReLU activations and
 
     Calibration is performed on the validation set using Platt scaling: a logistic regression `a·logit(p) + b` is fitted on validation predictions. A prior correction term is then added:
 
-    ```
+    ```python
     log_razon_prior = log(PI_PROD / (1 - PI_PROD)) - log(PI_sample / (1 - PI_sample))
     calibrated_logit = a · logit(p_raw) + b + log_razon_prior
     p_calibrated = sigmoid(calibrated_logit)
@@ -100,7 +100,7 @@ The subnetworks use two hidden layers (sizes 16 and 8) with ReLU activations and
 
     If any threshold is missed, the script prints the failures to stderr and exits with code 1. **No artifacts are written.** The CI pipeline does not proceed.
 
-    ```
+    ```text
       métrica sobre PRUEBA            red aditiva    LogReg (ref.)   mínimo del equipo
       roc_auc                               0.971          0.984             0.96
       pr_auc_prod                           0.481          0.530             0.45
@@ -225,7 +225,7 @@ After exporting, `entrenar.py` runs an automatic verification step. It loads the
 
 If either check fails, a `RuntimeError` is raised and the `.tmp` directory is never renamed — the previous production artifact is not overwritten. This ensures the ONNX export faithfully reproduces the trained network before it replaces the live model.
 
-```
+```text
 ONNX verificado: diferencia máxima en probabilidad 3.1e-06 y en aportes 8.7e-05
 Modelo exportado en servicio-ia/model (metadata.json, model.onnx, preprocesador.joblib, umbrales.json) · 142.3 s
 ```

@@ -1,7 +1,7 @@
 ---
-title: "Data Pipeline: From Raw CSVs to Production Model"
+title: "Data Pipeline: From Raw CSVs to a Production Model"
 sidebarTitle: "Overview"
-description: "The Guardián Centinela data pipeline ingests four raw CSVs, applies 19 documented cleaning rules, engineers 21 features, and splits data chronologically for model training."
+description: "Guardián Centinela's two-step pipeline cleans four raw CSVs with 19 rules, engineers 21 features, splits data by date, and produces a trained fraud model."
 ---
 
 The Guardián Centinela data pipeline is a two-step process that transforms raw transaction records into a trained, calibrated, and exported fraud model. The first step (`preparar.py`) handles all data work: profiling, cleaning, integration, feature engineering, and chronological splitting. The second step (`entrenar.py`) consumes the output of the first and produces the model artifacts that the inference service loads at runtime.

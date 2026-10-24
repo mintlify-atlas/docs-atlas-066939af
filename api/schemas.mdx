@@ -1,7 +1,7 @@
 ---
-title: "API Data Schemas: TransaccionInput, PerfilUsuario, PerfilDispositivo"
+title: "Inference API Schemas: TransaccionInput and Supporting Types"
 sidebarTitle: "Schemas"
-description: "Complete Pydantic schema definitions for TransaccionInput, PerfilUsuario, PerfilDispositivo, PrediccionResponse, and RazonExplicabilidad used by the inference and domain APIs."
+description: "Pydantic schemas for TransaccionInput, PerfilUsuario, PerfilDispositivo, PrediccionResponse, and RazonExplicabilidad used by the servicio-ia inference API."
 ---
 
 These schemas define the data contract between the domain microservice (`servicio-dominio`) and the inference microservice (`servicio-ia`). They are implemented as [Pydantic](https://docs.pydantic.dev/) `BaseModel` classes in `servicio-ia/main.py`. Both services share this contract; the domain service assembles the `TransaccionInput` payload from the database and forwards it to the inference service for scoring.
@@ -187,6 +187,8 @@ The domain service (`servicio-dominio`) uses its own stricter `Transaccion` Pyda
 | `mcc` | String matching `^\d{4}$` (regex) | `Any` — numeric or numeric string |
 | `timestamp` | Strict ISO 8601 with zone | ISO 8601, space-separated, or `dd/mm/YYYY HH:MM` |
 | `tarjeta_enmascarada` | PAN Luhn check applied | Not validated — any string accepted |
+| `intentos_previos_1h` | `Optional[int]` | `Optional[float]` with `ge=0` |
+| `latitud` / `longitud` | Not present | `Optional[float]` — accepted for normalisation, not passed to the domain model |
 
 The flexibility in `TransaccionInput` exists because `preparar.py` (the shared normalisation module) handles all format coercion before features are computed. The domain service enforces the strict contract at the public API boundary; by the time the payload reaches the inference service, the data has been validated and enriched.
 
