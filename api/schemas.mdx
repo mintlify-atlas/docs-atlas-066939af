@@ -1,0 +1,248 @@
+---
+title: "API Data Schemas: TransaccionInput, PerfilUsuario, PerfilDispositivo"
+sidebarTitle: "Schemas"
+description: "Complete Pydantic schema definitions for TransaccionInput, PerfilUsuario, PerfilDispositivo, PrediccionResponse, and RazonExplicabilidad used by the inference and domain APIs."
+---
+
+These schemas define the data contract between the domain microservice (`servicio-dominio`) and the inference microservice (`servicio-ia`). They are implemented as [Pydantic](https://docs.pydantic.dev/) `BaseModel` classes in `servicio-ia/main.py`. Both services share this contract; the domain service assembles the `TransaccionInput` payload from the database and forwards it to the inference service for scoring.
+
+All schemas are designed for internal service-to-service communication. The public-facing API exposed by the domain service performs additional validation (PAN check, strict currency enforcement, regex-validated MCC) before constructing these objects.
+
+---
+
+## TransaccionInput
+
+The root request schema for `POST /predict`. Represents a single payment transaction enriched with optional user, device, and blocklist context.
+
+| Field | Type | Required | Constraints | Notes |
+|---|---|---|---|---|
+| `transaccion_id` | `string` | ✅ | — | Unique transaction identifier; echoed in response |
+| `usuario_id` | `string` | ✅ | — | Joins to `PerfilUsuario` |
+| `comercio_id` | `string` | ✅ | — | Merchant identifier |
+| `dispositivo_id` | `string` | ❌ | — | If absent, device features are null-imputed |
+| `timestamp` | `string` | ✅ | See formats below | ISO 8601 preferred; zone-naive → Chile UTC−4 |
+| `monto` | `number \| string` | ✅ | Finite number or parseable text | Dot = decimal (JSON); see amount formats below |
+| `moneda` | `string` | ❌ | `"CLP"` or `"USD"` | Inferred from magnitude if absent |
+| `canal` | `string` | ✅ | `"app"`, `"web"`, `"pos"`, `"api"` | Unknown values → 422 |
+| `pais_transaccion` | `string` | ✅ | 2-letter ISO 3166-1 alpha-2 | Must match a training category |
+| `mcc` | `number \| string` | ✅ | Parseable to integer | Numeric MCC code (ISO 18245) |
+| `ip` | `string` | ❌ | — | Client IP for feature engineering |
+| `intentos_previos_1h` | `float` | ❌ | ≥ 0 | Omit if unknown; treated as missing → median imputation |
+| `tarjeta_enmascarada` | `string` | ❌ | — | Masked PAN (e.g. `****1234`) |
+| `usuario` | `PerfilUsuario` | ❌ | — | Nested user profile object |
+| `dispositivo` | `PerfilDispositivo` | ❌ | — | Nested device profile object |
+| `lista_negra_interna` | `boolean` | ❌ | default `false` | Soft blocklist match; model input only |
+| `lista_negra_dura` | `boolean` | ❌ | default `false` | Hard compliance blocklist; forces `"bloquear"` |
+
+<Note>
+  **`monto` accepts both number and string forms.** A JSON number uses the dot as the decimal separator (`1200.00`, `45.5`). A string in CLP style uses the dot as a thousands separator (`"$1.200"` → 1200 CLP). A string in comma-decimal style uses the comma as the decimal separator (`"45,50"` → 45.50). Internally, JSON numbers are converted to comma-decimal strings before being passed to `preparar.parse_monto` so that the dot/comma ambiguity is resolved deterministically.
+</Note>
+
+<Note>
+  **`timestamp` accepts three formats.** ISO 8601 with an explicit zone offset is strongly preferred (`2024-11-20T14:32:05-04:00`, `2024-11-20T18:32:05Z`). Zone-naive formats are also accepted: space-separated datetime (`2024-11-20 14:32:05`) and Chilean short form (`20/11/2024 14:32`). All zone-naive timestamps are assumed to be **Chile local time (UTC−4)**. Any unrecognised format returns `422 EntradaInvalida`.
+</Note>
+
+---
+
+## PerfilUsuario
+
+User profile data sourced by the domain service from the `usuarios` database table. Attached to `TransaccionInput.usuario`. All fields are optional.
+
+<ParamField body="pais_usuario" type="string">
+  Two-letter ISO 3166-1 alpha-2 country code of the user's registered country (e.g. `"CL"`, `"US"`). Normalised to uppercase internally.
+</ParamField>
+
+<ParamField body="segmento" type="string">
+  User segment classification. Accepted literal values:
+
+  - `"persona"` — individual consumer
+  - `"comercio_pequeno"` — small business
+  - `"comercio_grande"` — large business
+</ParamField>
+
+<ParamField body="verificado" type="float">
+  Identity verification score. Range: `0.0` (unverified) to `1.0` (fully verified). Constraint: `ge=0, le=1`.
+</ParamField>
+
+<ParamField body="telefono_verificado" type="float">
+  Phone number verification score. Range: `0.0`–`1.0`. Constraint: `ge=0, le=1`.
+</ParamField>
+
+<ParamField body="nivel_kyc" type="float">
+  KYC (Know Your Customer) completion level. Range: `0.0`–`3.0`. Constraint: `ge=0, le=3`.
+</ParamField>
+
+<ParamField body="dominio_desechable" type="float">
+  Probability that the user's email domain is a disposable or temporary address. Range: `0.0`–`1.0`. Constraint: `ge=0, le=1`.
+</ParamField>
+
+<ParamField body="fecha_registro" type="string">
+  Account registration date in `YYYY-MM-DD` format. Used by the feature engineering pipeline to compute account age in days. An invalid format returns `422 EntradaInvalida` with detail `"usuario.fecha_registro: formato inválido (YYYY-MM-DD)"`.
+</ParamField>
+
+<Note>
+  All `PerfilUsuario` fields are optional. A missing or `null` field is passed through to the preprocessor as `NaN`, where it is replaced by the training-set median for that feature. This matches the treatment applied during model training, so there is no distribution shift from missing data.
+</Note>
+
+---
+
+## PerfilDispositivo
+
+Device profile data sourced by the domain service from the `dispositivos` database table. Attached to `TransaccionInput.dispositivo`. All fields are optional.
+
+<ParamField body="tipo_dispositivo" type="string">
+  Device platform. Accepted literal values: `"android"`, `"ios"`, `"web"`, `"pos"`.
+</ParamField>
+
+<ParamField body="pais_disp" type="string">
+  Two-letter ISO 3166-1 alpha-2 country code of the device's registered or last-seen country. Normalised to uppercase internally.
+</ParamField>
+
+<ParamField body="emulador" type="float">
+  Emulator detection score. Range: `0.0` (physical device) to `1.0` (software emulator). Constraint: `ge=0, le=1`. A high score indicates the transaction originated from an emulated environment, which is a significant fraud signal.
+</ParamField>
+
+<Note>
+  If `TransaccionInput.dispositivo_id` is absent, the inference service ignores any `PerfilDispositivo` object provided and treats all device features as missing. Median imputation is applied during preprocessing.
+</Note>
+
+---
+
+## PrediccionResponse
+
+The response schema returned by `POST /predict` on success (`200 OK`).
+
+<ResponseField name="transaccion_id" type="string">
+  Echo of the request's `transaccion_id`. Use for log correlation and idempotency checks.
+</ResponseField>
+
+<ResponseField name="decision" type="string">
+  Three-zone decision produced by `decidir()`. One of `"aprobar"`, `"revisar"`, or `"bloquear"`. The thresholds vary by time-of-day zone (daytime vs. night): during the night window there is no `"revisar"` zone — transactions either `"aprobar"` or `"bloquear"`.
+</ResponseField>
+
+<ResponseField name="probabilidad_fraude" type="float">
+  Calibrated posterior probability of fraud, rounded to 5 decimal places. Derived from the raw ONNX output via Platt scaling: `z = a * log(p/(1-p)) + b + log_razon_prior`, then `p_prod = sigmoid(z)`. Range: `(0, 1)`.
+</ResponseField>
+
+<ResponseField name="razones" type="array[RazonExplicabilidad]">
+  The top three features ranked by `|aporte_logodds|`. May contain fewer than three entries if the model produced fewer contributing factors. See `RazonExplicabilidad` below.
+</ResponseField>
+
+<ResponseField name="version_modelo" type="string">
+  Semantic version of the ONNX model artefact (`modelo.onnx`) that produced this prediction. Read from `metadata.json` at startup.
+</ResponseField>
+
+<ResponseField name="version_umbrales" type="string">
+  Version of the decision threshold configuration (`umbrales.json`) applied to produce the three-zone decision.
+</ResponseField>
+
+<ResponseField name="latencia_ms" type="float">
+  Wall-clock inference latency in milliseconds, from the start of feature construction to the end of response serialization. Measured with `time.perf_counter()`.
+</ResponseField>
+
+<ResponseField name="regla_aplicada" type="string | null">
+  Name of the hard rule that forced the decision, if applicable (e.g. `"lista_negra"`). `null` when the decision was derived purely from the model's calibrated probability.
+</ResponseField>
+
+---
+
+## RazonExplicabilidad
+
+A single explainability factor included in `PrediccionResponse.razones`. Each element describes how much one feature contributed to the final calibrated log-odds.
+
+<ResponseField name="factor" type="string">
+  Internal feature name as it appears in `metadata.json` (e.g. `"hora_local"`, `"monto_valor"`, `"nivel_kyc"`, `"emulador"`).
+</ResponseField>
+
+<ResponseField name="descripcion" type="string">
+  Human-readable description generated at inference time (currently `"Aporte del factor {factor}"`).
+</ResponseField>
+
+<ResponseField name="valor" type="any">
+  The feature's actual value for this transaction. May be a `float`, `string`, `boolean`, or `null` (when the feature was imputed). The type depends on the feature.
+</ResponseField>
+
+<ResponseField name="aporte_logodds" type="float">
+  The feature's contribution in log-odds space after calibration scaling (`delta * calib["a"]`). Rounded to 3 decimal places.
+</ResponseField>
+
+<ResponseField name="efecto" type="string">
+  Plain-language direction: `"sube el riesgo"` when `aporte_logodds > 0`, `"baja el riesgo"` when `aporte_logodds < 0`.
+</ResponseField>
+
+<Tip>
+  A **positive** `aporte_logodds` means the feature pushes the transaction toward being classified as fraud — it increases the calibrated probability. A **negative** value means the feature provides evidence against fraud, lowering the probability. The three reasons are always ordered by `|aporte_logodds|` descending, so the first reason is the most influential factor for this specific transaction.
+</Tip>
+
+---
+
+## Domain-Side `Transaccion` Model vs. `TransaccionInput`
+
+The domain service (`servicio-dominio`) uses its own stricter `Transaccion` Pydantic model before constructing `TransaccionInput`. The key differences are:
+
+| Property | Domain `Transaccion` (strict) | Inference `TransaccionInput` (flexible) |
+|---|---|---|
+| `monto` | Validated numeric type; no text | Accepts JSON number **or** text string |
+| `moneda` | Required; must be `"CLP"` or `"USD"` | Optional; inferred from magnitude if absent |
+| `mcc` | String matching `^\d{4}$` (regex) | `Any` — numeric or numeric string |
+| `timestamp` | Strict ISO 8601 with zone | ISO 8601, space-separated, or `dd/mm/YYYY HH:MM` |
+| `tarjeta_enmascarada` | PAN Luhn check applied | Not validated — any string accepted |
+
+The flexibility in `TransaccionInput` exists because `preparar.py` (the shared normalisation module) handles all format coercion before features are computed. The domain service enforces the strict contract at the public API boundary; by the time the payload reaches the inference service, the data has been validated and enriched.
+
+---
+
+## Complete TransaccionInput Example
+
+The following JSON shows a fully-populated `TransaccionInput` payload with all optional fields present.
+
+```json
+{
+  "transaccion_id": "txn-2024-abc123",
+  "usuario_id": "usr-88201",
+  "comercio_id": "com-5543",
+  "dispositivo_id": "dev-99012",
+  "timestamp": "2024-11-20T14:32:05-04:00",
+  "monto": 154990.00,
+  "moneda": "CLP",
+  "canal": "app",
+  "pais_transaccion": "CL",
+  "mcc": 5411,
+  "ip": "190.20.14.33",
+  "intentos_previos_1h": 1,
+  "tarjeta_enmascarada": "****7821",
+  "usuario": {
+    "pais_usuario": "CL",
+    "segmento": "persona",
+    "verificado": 1.0,
+    "telefono_verificado": 1.0,
+    "nivel_kyc": 2.0,
+    "dominio_desechable": 0.0,
+    "fecha_registro": "2021-03-15"
+  },
+  "dispositivo": {
+    "tipo_dispositivo": "android",
+    "pais_disp": "CL",
+    "emulador": 0.0
+  },
+  "lista_negra_interna": false,
+  "lista_negra_dura": false
+}
+```
+
+The minimum viable payload (only required fields) looks like this:
+
+```json
+{
+  "transaccion_id": "txn-2024-min001",
+  "usuario_id": "usr-00042",
+  "comercio_id": "com-1001",
+  "timestamp": "2024-11-20T18:00:00Z",
+  "monto": 9990,
+  "canal": "web",
+  "pais_transaccion": "CL",
+  "mcc": 7372
+}
+```
+
+All omitted optional fields (`dispositivo_id`, `moneda`, `ip`, `intentos_previos_1h`, `tarjeta_enmascarada`, `usuario`, `dispositivo`, `lista_negra_interna`, `lista_negra_dura`) default to `null` or `false` and are handled by median imputation in the preprocessor.

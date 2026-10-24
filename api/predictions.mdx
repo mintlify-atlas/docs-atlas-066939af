@@ -1,0 +1,220 @@
+---
+title: "GET /predicciones — List and Replay Fraud Decisions"
+sidebarTitle: "GET /predicciones"
+description: "GET /api/dominio/predicciones lists recent fraud decisions. GET /api/dominio/predicciones/{transaccion_id} replays all decisions for a specific transaction ID."
+---
+
+Guardián Centinela persists every fraud decision to the `predicciones` table the moment it is made. These two endpoints expose that log — one for browsing the most recent decisions across all transactions, and one for replaying the complete decision history of a single transaction. Both are primarily used for auditing, compliance reporting, and debugging.
+
+**Base URL (via gateway):** `http://localhost:8080/api/dominio`
+
+---
+
+## GET /predicciones
+
+Returns the most recent fraud decisions across all transactions, ordered from newest to oldest.
+
+### Query parameters
+
+<ParamField query="limit" type="integer">
+  Maximum number of records to return. Accepted range: `1`–`200`. Defaults to `20`.
+</ParamField>
+
+### Response — 200 OK
+
+An array of decision summary objects ordered by `prediccion_id DESC` (most recent first).
+
+<ResponseField name="prediccion_id" type="integer">
+  Auto-incremented primary key that establishes the chronological order of decisions.
+</ResponseField>
+
+<ResponseField name="transaccion_id" type="string">
+  The transaction identifier associated with this decision.
+</ResponseField>
+
+<ResponseField name="usuario_id" type="string">
+  The user who initiated the transaction.
+</ResponseField>
+
+<ResponseField name="decision" type="string">
+  The fraud decision outcome: `"aprobar"`, `"revisar"`, or `"bloquear"`.
+</ResponseField>
+
+<ResponseField name="origen" type="string">
+  Which system produced the decision: `"modelo"`, `"regla_dura"`, or `"reserva"`.
+</ResponseField>
+
+<ResponseField name="probabilidad" type="number | null">
+  Calibrated fraud probability `[0, 1]`, or `null` when the fallback engine was used.
+</ResponseField>
+
+<ResponseField name="version_modelo" type="string | null">
+  Model version that scored the transaction, or `null` for fallback decisions.
+</ResponseField>
+
+<ResponseField name="version_umbrales" type="string | null">
+  Threshold configuration version, or `null` for fallback decisions.
+</ResponseField>
+
+<ResponseField name="latencia_ms" type="number">
+  Total processing time for the original request, in milliseconds.
+</ResponseField>
+
+<ResponseField name="creado_utc" type="string">
+  ISO 8601 UTC timestamp of when the decision was persisted.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash cURL
+curl -s "http://localhost:8080/api/dominio/predicciones?limit=3"
+```
+
+```json Response
+[
+  {
+    "prediccion_id": 1049,
+    "transaccion_id": "TXN-9CF1A07E23BB",
+    "usuario_id": "USR-00117",
+    "decision": "revisar",
+    "origen": "modelo",
+    "probabilidad": 0.612,
+    "version_modelo": "nam-v2.1.0",
+    "version_umbrales": "umbrales-2024-10",
+    "latencia_ms": 143.77,
+    "creado_utc": "2024-11-15T14:35:22.101Z"
+  },
+  {
+    "prediccion_id": 1048,
+    "transaccion_id": "TXN-B3E4F200DC91",
+    "usuario_id": "USR-00088",
+    "decision": "bloquear",
+    "origen": "regla_dura",
+    "probabilidad": 0.941,
+    "version_modelo": "nam-v2.1.0",
+    "version_umbrales": "umbrales-2024-10",
+    "latencia_ms": 98.12,
+    "creado_utc": "2024-11-15T14:33:05.449Z"
+  },
+  {
+    "prediccion_id": 1047,
+    "transaccion_id": "TXN-3FA2C8D91B04",
+    "usuario_id": "USR-00042",
+    "decision": "aprobar",
+    "origen": "modelo",
+    "probabilidad": 0.034,
+    "version_modelo": "nam-v2.1.0",
+    "version_umbrales": "umbrales-2024-10",
+    "latencia_ms": 118.45,
+    "creado_utc": "2024-11-15T14:30:01.882Z"
+  }
+]
+```
+
+</CodeGroup>
+
+---
+
+## GET /predicciones/\{transaccion\_id\}
+
+Returns **all** recorded decisions for a specific transaction. Because the same `transaccion_id` can be submitted to `POST /evaluar` more than once — for example, when a retried payment is re-evaluated — this endpoint returns the full ordered history so you can see how model versions or threshold changes affected the outcome over time.
+
+### Path parameters
+
+<ParamField path="transaccion_id" type="string" required>
+  The transaction identifier to replay. Must match a value in the `predicciones` table exactly.
+</ParamField>
+
+### Response — 200 OK
+
+An array of full `predicciones` records (`SELECT * FROM predicciones`) ordered by `prediccion_id ASC` (earliest decision first). Each record includes all columns: `prediccion_id`, `transaccion_id`, `usuario_id`, `dispositivo_id`, `entrada` (the complete enriched payload sent to the IA), `probabilidad`, `decision`, `origen`, `razones`, `version_modelo`, `version_umbrales`, `latencia_ms`, and `creado_utc`.
+
+### Error responses
+
+| Status | Meaning |
+|--------|---------|
+| `404 Not Found` | No decisions exist for the given `transaccion_id`. Response body: `{"detail": "Sin decisiones registradas para esa transacción"}` |
+
+### Example
+
+<CodeGroup>
+
+```bash cURL
+curl -s "http://localhost:8080/api/dominio/predicciones/TXN-3FA2C8D91B04"
+```
+
+```json Response
+[
+  {
+    "prediccion_id": 1047,
+    "transaccion_id": "TXN-3FA2C8D91B04",
+    "usuario_id": "USR-00042",
+    "dispositivo_id": "DEV-A1B2C3",
+    "entrada": {
+      "transaccion_id": "TXN-3FA2C8D91B04",
+      "usuario_id": "USR-00042",
+      "comercio_id": "COM-0081",
+      "dispositivo_id": "DEV-A1B2C3",
+      "monto": 34900,
+      "moneda": "CLP",
+      "canal": "app",
+      "mcc": 5411,
+      "pais_transaccion": "CL",
+      "ip": "190.45.12.88",
+      "intentos_previos_1h": 0,
+      "tarjeta_enmascarada": "****7731",
+      "usuario": {
+        "pais_usuario": "CL",
+        "segmento": "retail",
+        "verificado": true,
+        "nivel_kyc": 2
+      },
+      "dispositivo": {
+        "tipo_dispositivo": "mobile",
+        "pais_disp": "CL",
+        "emulador": false
+      },
+      "lista_negra_interna": false,
+      "lista_negra_dura": false
+    },
+    "probabilidad": 0.034,
+    "decision": "aprobar",
+    "origen": "modelo",
+    "razones": [
+      {
+        "tipo": "modelo",
+        "factor": "monto_relativo",
+        "descripcion": "Monto dentro del rango habitual del usuario",
+        "aporte_logodds": -1.42,
+        "efecto": "reduce_riesgo"
+      }
+    ],
+    "version_modelo": "nam-v2.1.0",
+    "version_umbrales": "umbrales-2024-10",
+    "latencia_ms": 118.45,
+    "creado_utc": "2024-11-15T14:30:01.882Z"
+  }
+]
+```
+
+</CodeGroup>
+
+<CodeGroup>
+
+```bash cURL — 404 example
+curl -s "http://localhost:8080/api/dominio/predicciones/TXN-NOTEXIST"
+```
+
+```json 404 Response
+{
+  "detail": "Sin decisiones registradas para esa transacción"
+}
+```
+
+</CodeGroup>
+
+<Note>
+  This endpoint implements **RF7 — replay capability**. The `entrada` column in each row stores the complete enriched payload that was actually sent to the IA service (including resolved user and device profiles and blocklist flags). Combined with `version_modelo` and `version_umbrales`, you can reconstruct exactly what data, what model, and what thresholds produced any given decision — a full audit trail from input to outcome.
+</Note>

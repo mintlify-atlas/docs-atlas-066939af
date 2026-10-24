@@ -1,20 +1,56 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "Guardián Centinela: Real-Time Fraud Detection for Kipu Pagos"
+sidebarTitle: "Home"
+description: "Guardián Centinela is a containerized microservices system that scores payment transactions for fraud in real time using an explainable neural additive model."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+Guardián Centinela is the fraud detection engine for Kipu Pagos. It evaluates every payment transaction in real time, returning one of three decisions — **approve**, **review**, or **block** — along with a calibrated fraud probability and the top factors that drove the decision. The system is built as five Docker services wired together: an Nginx API gateway, a domain business API, an explainable ML inference service (2 replicas), a one-shot data loader, and a PostgreSQL database.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run the full system locally with Docker Compose in under five minutes
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand the five services, data flow, and design decisions
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/evaluate">
+    Explore every endpoint — evaluate transactions, replay decisions, query users
+  </Card>
+  <Card title="Data Pipeline" icon="database" href="/data/overview">
+    How raw CSVs become a trained, production-ready fraud model
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## How It Works
+
+<Steps>
+  <Step title="Data preparation">
+    Run `datos/preparar.py` to clean the four raw CSVs, engineer model features, and split data into train/validation/test sets by date.
+  </Step>
+  <Step title="Model training">
+    Run `servicio-ia/entrenar.py` to train an explainable Neural Additive Model (NAM) with TensorFlow/Keras. The training pipeline applies Platt calibration, searches for optimal decision thresholds, and only exports the model if it passes the quality gate (ROC-AUC ≥ 0.96).
+  </Step>
+  <Step title="Deploy with Docker Compose">
+    Run `docker compose up -d` to start all five services. The gateway is the only port exposed (`localhost:8080`). The data loader runs once, seeding the database, and then exits.
+  </Step>
+  <Step title="Evaluate transactions">
+    Send a `POST /api/dominio/evaluar` request with transaction details. The domain service enriches it with user and device profiles, checks the blocklist, calls the inference service, records the decision, and returns a structured response in milliseconds.
+  </Step>
+</Steps>
+
+## Key Capabilities
+
+<CardGroup cols={2}>
+  <Card title="Explainable Decisions" icon="magnifying-glass">
+    Every prediction includes the top three factors that raised or lowered risk, computed directly from the NAM's additive architecture.
+  </Card>
+  <Card title="Compliance Hard Rules" icon="shield-halved">
+    Compliance-grade blocklist entries force an immediate block regardless of model score. PAN numbers are rejected at the API boundary.
+  </Card>
+  <Card title="Fallback Policy" icon="arrow-rotate-left">
+    If the inference service is unavailable, the domain service applies a configurable reservation policy (rule-based, approve-all, or block-all) to ensure continuity.
+  </Card>
+  <Card title="Full Audit Trail" icon="clock-rotate-left">
+    Every decision is stored with its full input payload, fraud probability, model version, decision thresholds, and latency breakdown.
+  </Card>
+</CardGroup>

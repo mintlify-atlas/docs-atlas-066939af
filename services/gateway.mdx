@@ -1,0 +1,164 @@
+---
+title: "API Gateway: Nginx Routing, Rate Limiting, and Load Balancing"
+sidebarTitle: "Gateway"
+description: "The Guardián Centinela Nginx gateway routes traffic to three upstreams, enforces a 400 req/s rate limit, and distributes inference load across two IA replicas with automatic failover."
+---
+
+The gateway (`servicio-gateway`) is the single public entry point for the entire Guardián Centinela system. It is the **only** container that exposes a host port (`8080`). Every other service — dominio, IA replicas, and the front-end — lives exclusively on the internal Docker network and is unreachable from outside. All routing, rate limiting, load balancing, and error normalization happen here before a single byte reaches a business service.
+
+## Route table
+
+The Nginx configuration defines three named upstreams and four location blocks. The table below maps every public path to its upstream target and the timeout that applies.
+
+| Path prefix | Upstream | Timeout | Methods |
+|---|---|---|---|
+| `/api/dominio/` | `dominio:8000` | `proxy_read_timeout 5s` | All |
+| `/api/ia/` | `ia:8000` (2 replicas, round-robin) | `proxy_read_timeout 2s` | GET, POST only |
+| `/` | `front:80` | — | All |
+| `/health` (exact) | *(no upstream)* | — | GET |
+
+The IA location enforces method restriction at the Nginx level — any other verb receives an immediate `403` before the request is proxied.
+
+```nginx
+location /api/dominio/ {
+    limit_req zone=api burst=200 nodelay;
+    proxy_pass http://dominio_up/;
+    proxy_connect_timeout 1s;
+    proxy_read_timeout 5s;
+}
+
+location /api/ia/ {
+    limit_except GET POST { deny all; }
+    limit_req zone=api burst=200 nodelay;
+    proxy_pass http://ia_up/;
+    proxy_connect_timeout 300ms;
+    proxy_read_timeout 2s;
+    proxy_next_upstream error timeout http_502 http_503 non_idempotent;
+    proxy_next_upstream_tries 2;
+}
+```
+
+## Rate limiting
+
+A single `limit_req_zone` applies to every proxied location:
+
+```nginx
+# ~92 req/s peak (5 500/min) measured in chapter 7.2 → ceiling set at 4× = 400 req/s
+map $request_method $tope { default "kipu"; }
+limit_req_zone $tope zone=api:1m rate=400r/s;
+```
+
+Each location activates it with `burst=200 nodelay`, meaning up to 200 requests above the steady-state rate are served immediately without queuing. Requests beyond the burst ceiling receive a `429` response.
+
+The 400 req/s ceiling is set at **roughly 4× the measured peak** of approximately 92 req/s (5,500 transactions per minute, as profiled in the load-testing chapter). This provides ample headroom for legitimate traffic spikes while still bounding the blast radius of a runaway client or crawler.
+
+## IA load balancing and failover
+
+The `ia_up` upstream block targets the single Docker DNS name `ia`, which resolves to one IP address per running replica. Nginx distributes requests round-robin across all resolved addresses:
+
+```nginx
+upstream ia_up {
+    zone ia 64k;
+    server ia:8000 resolve max_fails=1 fail_timeout=10s;
+    keepalive 16;
+}
+```
+
+Key failover parameters:
+
+- **`max_fails=1`** — a single failed response marks the replica as temporarily unavailable.
+- **`fail_timeout=10s`** — the replica is excluded from the pool for 10 seconds, then retried.
+- **`proxy_next_upstream error timeout http_502 http_503 non_idempotent`** — on any of those conditions the request is transparently retried on the other replica (up to `proxy_next_upstream_tries 2`).
+
+Because `/predict` is a pure scoring call with no side-effects, the `non_idempotent` flag is safe: retrying a POST on the second replica does not double-spend or duplicate any database row.
+
+## DNS re-resolution
+
+```nginx
+resolver 127.0.0.11 valid=5s ipv6=off;
+resolver_timeout 2s;
+```
+
+`127.0.0.11` is Docker's embedded DNS resolver. Setting `valid=5s` overrides the TTL and forces Nginx to re-query the DNS every five seconds. Combined with `resolve` on the `server` directive, this means a restarted IA replica — which gets a new internal IP — automatically rejoins the pool within five seconds without any Nginx reload.
+
+## Security headers
+
+Every response carries two security headers regardless of upstream:
+
+```nginx
+add_header X-Content-Type-Options nosniff always;
+add_header X-Frame-Options DENY always;
+add_header X-Upstream $upstream_addr always;   # which replica responded (useful for debugging)
+```
+
+`server_tokens off` additionally suppresses the Nginx version string from error pages and the `Server` header.
+
+## Error responses
+
+Upstream failures (502, 503, 504) and rate-limit rejections (429) are intercepted and returned as stable JSON payloads rather than Nginx's default HTML pages:
+
+```json
+// 502 / 503 / 504
+{
+  "error": "servicio_no_disponible",
+  "detalle": "el gateway no obtuvo respuesta del servicio",
+  "request_id": "<nginx $request_id>"
+}
+
+// 429
+{
+  "error": "demasiadas_peticiones"
+}
+```
+
+## Health check
+
+The `/health` endpoint is handled entirely within Nginx — no upstream is contacted:
+
+```nginx
+location = /health {
+    access_log off;
+    default_type application/json;
+    return 200 '{"status":"healthy","servicio":"servicio-gateway"}';
+}
+```
+
+<Steps>
+  <Step title="Verify the gateway is running">
+    Send a GET request to the health endpoint:
+
+    ```bash
+    curl -s http://localhost:8080/health
+    ```
+  </Step>
+  <Step title="Inspect the response">
+    A healthy gateway returns HTTP 200 with the following body:
+
+    ```json
+    {"status":"healthy","servicio":"servicio-gateway"}
+    ```
+  </Step>
+  <Step title="Check which IA replica responded">
+    Every response from `/api/ia/` includes an `X-Upstream` header showing the replica IP:
+
+    ```bash
+    curl -si -X POST http://localhost:8080/api/ia/predict \
+      -H "Content-Type: application/json" \
+      -d '{"transaccion_id":"TEST-01", ...}' \
+      | grep X-Upstream
+    ```
+  </Step>
+</Steps>
+
+## Resource limits
+
+Resource quotas are set in `compose.yaml` and apply to the single gateway container:
+
+| Resource | Limit |
+|---|---|
+| CPU | 0.50 cores |
+| Memory | 64 MB |
+
+<Note>
+The gateway has no persistent state and no database connection. Restarting it is safe at any time and takes effect in seconds. Docker Compose restarts it automatically on failure (`restart: unless-stopped`).
+</Note>

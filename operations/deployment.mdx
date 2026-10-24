@@ -1,0 +1,212 @@
+---
+title: "Deploy Guardián Centinela with Docker Compose"
+sidebarTitle: "Deployment"
+description: "Step-by-step guide to deploy the full Guardián Centinela stack using Docker Compose, including service startup order, health checks, volume management, and resource constraints."
+---
+
+Guardián Centinela ships as six containerized services orchestrated with Docker Compose. Every image is pre-built for `linux/amd64` and published to the GitHub Container Registry (GHCR) — there is nothing to compile on the target host. A single `up -d` command brings the entire fraud detection stack online.
+
+## Prerequisites
+
+Before deploying, make sure the host meets the following requirements:
+
+| Requirement | Minimum version / amount |
+|---|---|
+| Docker Engine | 24+ |
+| Docker Compose | v2 (plugin, not standalone) |
+| Free RAM | 1.5 GB |
+| Architecture | `linux/amd64` |
+
+The stack exposes **one port only**: `8080` for the nginx gateway. No other ports need to be open.
+
+## Environment variables
+
+All runtime tunables have safe local defaults and are read from a `.env` file placed in the project directory. Copy the example file and adjust as needed:
+
+```bash
+cp .env.example .env
+```
+
+The three variables you can override are:
+
+```bash
+# .env.example
+POSTGRES_PASSWORD=kipu_local
+IA_TIMEOUT_MS=500
+POLITICA_RESERVA=reglas
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `POSTGRES_PASSWORD` | `kipu_local` | Password for the `kipu` PostgreSQL user |
+| `IA_TIMEOUT_MS` | `500` | Milliseconds the domain service waits for the IA service before falling back to `POLITICA_RESERVA` |
+| `POLITICA_RESERVA` | `reglas` | Fallback strategy when IA is unavailable (`reglas` = rule-based, `bloquear`, or `aprobar`) |
+
+<Note>
+None of these variables are secrets in production-like configurations. For a real deployment, set `POSTGRES_PASSWORD` to a strong value and manage it with your secrets manager of choice — the compose file never hard-codes credentials.
+</Note>
+
+## Deployment steps
+
+<Steps>
+  <Step title="Pull all images from GHCR">
+    Fetch every service image before starting. This validates that all images are accessible and avoids partial pulls during startup.
+
+    ```bash
+    docker compose -p equipoNN pull
+    ```
+
+    The project flag `-p equipoNN` scopes all container and network names. Replace `NN` with your team number to avoid naming collisions when multiple teams share the same Docker host.
+
+    The six images pulled are:
+
+    ```
+    ghcr.io/ser-martinezs/servicio-gateway:ep2
+    ghcr.io/ser-martinezs/servicio-front:ep2
+    ghcr.io/ser-martinezs/servicio-dominio:ep2
+    ghcr.io/ser-martinezs/servicio-ia:ep2
+    ghcr.io/ser-martinezs/servicio-carga:ep2
+    postgres:16-alpine
+    ```
+  </Step>
+
+  <Step title="Start the stack in detached mode">
+    ```bash
+    docker compose -p equipoNN up -d
+    ```
+
+    Docker Compose respects the `depends_on` conditions declared in `compose.yaml` and starts services in dependency order. The startup sequence is described in the next section.
+  </Step>
+
+  <Step title="Wait for all services to become healthy">
+    Startup is not instantaneous. The `carga` service runs a one-shot database seed before the application services begin. Poll until every service is healthy:
+
+    ```bash
+    docker compose -p equipoNN ps
+    ```
+
+    A fully healthy stack looks like this:
+
+    ```
+    NAME                         STATUS
+    equipoNN-db-1                healthy
+    equipoNN-carga-1             exited (0)
+    equipoNN-dominio-1           healthy
+    equipoNN-ia-1                healthy
+    equipoNN-ia-2                healthy
+    equipoNN-front-1             healthy
+    equipoNN-gateway-1           healthy
+    ```
+
+    The `carga` service exits with code `0` after seeding the database — this is expected and correct.
+  </Step>
+
+  <Step title="Verify the gateway is reachable">
+    ```bash
+    curl http://localhost:8080/health
+    ```
+
+    Expected response:
+
+    ```json
+    {"status": "healthy", "servicio": "servicio-gateway"}
+    ```
+
+    If the gateway returns `503`, one of its upstream services (`front`, `dominio`, or `ia`) has not yet passed its healthcheck. Wait a few seconds and retry.
+  </Step>
+</Steps>
+
+## Service startup timeline
+
+The `depends_on` conditions in `compose.yaml` enforce a strict startup order:
+
+```
+db (pg_isready healthy)
+  └─► carga (completes_successfully, exit 0)
+        └─► dominio (healthcheck: /health → 200)
+        └─► ia     (healthcheck: /health → 200, start_period 20s)
+              └─► front   (healthcheck: /health → 200)
+              └─► gateway (healthcheck: /health → 200)
+```
+
+**Key details:**
+
+- **`db`** uses `pg_isready -U kipu -d kipu` with a 5-second interval and up to 10 retries (50 s maximum wait). The PostgreSQL data directory is initialized on the first start from the `datos-pg` named volume.
+- **`carga`** is a one-shot container (`restart: "no"`). It runs `carga.py`, seeds reference tables using `ON CONFLICT DO NOTHING` (making it safe to run multiple times), then exits with code `0`. Both `dominio` and `ia` declare `condition: service_completed_successfully` on `carga`, so neither starts until this seed finishes.
+- **`dominio`** and **`ia`** start in parallel once `carga` completes. Each has a `start_period` (10 s for `dominio`, 20 s for `ia`) to load models or warm up connection pools before healthchecks begin.
+- **`gateway`** starts only after `front`, `dominio`, and `ia` are all healthy — ensuring the nginx upstream pool is complete before any traffic is accepted.
+
+## Data persistence: the `datos-pg` volume
+
+PostgreSQL data is stored in the named volume `datos-pg`. This volume is created automatically by Docker Compose and persists across `up`/`down` cycles.
+
+```yaml
+volumes:
+  datos-pg:
+```
+
+All prediction history, transaction records, and reference tables live in this volume. Handle it with care.
+
+## Resource limits
+
+Every service has `cpus` and `mem_limit` constraints tuned from `docker stats` measurements. These limits prevent a runaway service from starving the rest of the stack:
+
+| Service | CPUs | Memory |
+|---|---|---|
+| `gateway` | 0.50 | 64 MB |
+| `front` | 0.25 | 32 MB |
+| `dominio` | 1.00 | 256 MB |
+| `ia` | 0.50 | 512 MB |
+| `carga` | 0.50 | 128 MB |
+| `db` | 1.00 | 256 MB |
+
+<Note>
+The `ia` service has the highest memory limit because it loads the TensorFlow model into RAM on startup. If the container is OOM-killed (exit code 137), increase `mem_limit` for `ia` in your local override file.
+</Note>
+
+## Scaling IA replicas
+
+`compose.yaml` declares two replicas of the inference service:
+
+```yaml
+ia:
+  image: ghcr.io/ser-martinezs/servicio-ia:ep2
+  deploy:
+    replicas: 2
+```
+
+The gateway automatically round-robins requests across both replicas. Each replica operates independently; if one fails its healthcheck, the gateway retries the other. You can observe which replica served a given request through the `X-Upstream` response header added by nginx.
+
+To temporarily scale to a single replica (e.g., for debugging):
+
+```bash
+docker compose -p equipoNN up -d --scale ia=1
+```
+
+## Stop and cleanup
+
+**Stop the stack and keep all data:**
+
+```bash
+docker compose -p equipoNN down
+```
+
+The `datos-pg` volume is preserved. Bring the stack back up with `up -d` and all history remains intact.
+
+**Stop the stack and remove all data:**
+
+```bash
+docker compose -p equipoNN down -v
+```
+
+<Warning>
+Running `down -v` permanently deletes the `datos-pg` volume, which contains all prediction history, transaction records, and seeded reference data. This cannot be undone. The next `up -d` will start from a completely empty database and run `carga` again to re-seed only the static reference tables.
+</Warning>
+
+## Image tag reference
+
+| Tag | Meaning |
+|---|---|
+| `:ep2` | Release images — the versions declared in `compose.yaml`. Always pull these for a known-good deployment. |
+| `:latest` | Tracks the tip of `main`. Updated automatically on every merge. May be ahead of the `:ep2` release. |
+| `:sha-<short>` | Immutable commit-pinned tag. Useful for rollbacks: `docker compose -p equipoNN up -d` after editing image tags in `compose.yaml`. |

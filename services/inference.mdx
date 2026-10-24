@@ -1,0 +1,222 @@
+---
+title: "Inference Service: ONNX NAM Fraud Scoring"
+sidebarTitle: "Inference Service"
+description: "The inference microservice loads a Neural Additive Model from ONNX, preprocesses transactions using the same logic as training, and returns calibrated fraud probabilities with per-factor explanations."
+---
+
+The inference service (`servicio-ia`) is a stateless FastAPI microservice that loads a trained Neural Additive Model (NAM) from an ONNX file and scores incoming transactions in real time. It has **no database connection** — the domain service performs all database reads and forwards the enriched transaction payload. Two replicas run by default, and the Nginx gateway distributes load between them with round-robin balancing and automatic failover.
+
+## Artifact loading at startup
+
+On startup, `cargar_artefactos()` loads four files from the `RUTA_MODELO` directory:
+
+```python
+prep   = joblib.load(RUTA_MODELO / "preprocesador.joblib")
+sesion = ort.InferenceSession(
+    str(RUTA_MODELO / "modelo.onnx"),
+    sess_options=opciones,
+    providers=["CPUExecutionProvider"]
+)
+metadata = json.loads((RUTA_MODELO / "metadata.json").read_text(encoding="utf-8"))
+umbrales = json.loads((RUTA_MODELO / "umbrales.json").read_text(encoding="utf-8"))
+```
+
+| Artifact | Purpose |
+|---|---|
+| `preprocesador.joblib` | sklearn `ColumnTransformer` — same scaler/encoder fitted during training |
+| `modelo.onnx` | Serialized NAM graph |
+| `metadata.json` | Feature lists, calibration coefficients (`a`, `b`, `log_razon_prior`), factor names, version string |
+| `umbrales.json` | Decision thresholds per time-of-day zone (`bloquear_dia`, `revisar_dia`, `bloquear_noche`), version string |
+
+<Note>
+If any artifact is missing or fails to load, the service still starts successfully, but `GET /health` and `POST /predict` both return **HTTP 503** until the artifacts are available. This prevents `compose.yaml` from marking the service healthy prematurely. Set the `RUTA_MODELO` environment variable to override the default `./model` path inside the container. Set `ORT_THREADS` to control how many ONNX Runtime threads each inference session may use (default: `1` — one thread per request, which keeps latency honest under the CPU limits of the container).
+</Note>
+
+## Input contract — `TransaccionInput`
+
+The domain service sends a JSON body that matches the following Pydantic model:
+
+| Field | Type | Notes |
+|---|---|---|
+| `transaccion_id` | `str` | Required |
+| `usuario_id` | `str` | Required |
+| `comercio_id` | `str` | Required |
+| `dispositivo_id` | `str` (optional) | `None` → device features are null in the model |
+| `timestamp` | `str` | ISO8601 with timezone (`Z`, `-04:00`), `YYYY-MM-DD HH:MM:SS`, or `dd/mm/YYYY HH:MM` |
+| `monto` | number or text | JSON number (decimal point) or text like `"$1.200"` (= 1,200 CLP) or `"45,50"` |
+| `moneda` | `str` (optional) | `CLP` or `USD`; inferred if absent |
+| `canal` | `str` | `app`, `web`, `pos`, or `api` |
+| `pais_transaccion` | `str` | 2-letter ISO country code |
+| `mcc` | number or text | Normalized to a 4-digit string |
+| `ip` | `str` (optional) | — |
+| `intentos_previos_1h` | `float` (optional) | Absent = treated as missing by the model |
+| `tarjeta_enmascarada` | `str` (optional) | Never a full PAN |
+| `usuario` | `PerfilUsuario` (optional) | User profile from the `usuarios` table |
+| `dispositivo` | `PerfilDispositivo` (optional) | Device profile from the `dispositivos` table |
+| `lista_negra_interna` | `bool` | `True` if a non-hard blacklist entry matched |
+| `lista_negra_dura` | `bool` | `True` if a compliance-mandated blacklist entry matched |
+
+## Feature construction
+
+The service reuses `preparar.py` — the same module used during model training — to guarantee that training and serving apply identical transformations. There is no separate inference preprocessing code.
+
+```python
+def construir_features(tx: TransaccionInput) -> pd.DataFrame:
+    n = _normalizar(tx)                    # preparar.normalizar_transacciones()
+    x = preparar.construir_variables(      # preparar.construir_variables()
+        n,
+        _df_usuario(tx.usuario_id, tx.usuario),
+        _df_dispositivo(tx.dispositivo_id, tx.dispositivo),
+        _LISTA_NEGRA_VACIA                 # blacklist already evaluated by domain service
+    )
+    x["lista_negra_interna"] = 1.0 if tx.lista_negra_interna else 0.0
+    x["lista_negra_dura"] = bool(tx.lista_negra_dura)
+    return x
+```
+
+The resulting DataFrame has all 21 features. When a user or device profile is absent, the corresponding columns are `null` — exactly as they were during training on incomplete rows, so the model handles them without imputation surprises.
+
+## Calibration
+
+The raw ONNX output is a single float in (0, 1). Two corrections are applied before the final probability is returned:
+
+1. **Platt scaling** — `a · logit(p_raw) + b` shifts the logit to correct for model over/under-confidence.
+2. **Production prior correction** — `+ log_razon_prior` shifts the log-odds to account for the difference between the training prevalence and the expected live fraud rate.
+
+```python
+calib = estado["metadata"]["calibracion"]
+pc = float(np.clip(p_cruda, 1e-9, 1 - 1e-9))
+z  = calib["a"] * math.log(pc / (1 - pc)) + calib["b"] + calib["log_razon_prior"]
+p_prod = float(1 / (1 + math.exp(-z)))
+```
+
+## Decision logic
+
+`decidir()` replicates `decidir_zona()` from `entrenar.py` exactly, so inference and offline evaluation use the same rules:
+
+```python
+def decidir(p: float, hora: float, dura: bool, umb: dict, turno) -> str:
+    if dura:
+        return "bloquear"
+    en_turno = turno[0] <= hora < turno[1]    # 08:00–22:00 Chile time
+    umbral_bloqueo  = umb["bloquear_dia"]  if en_turno else umb["bloquear_noche"]
+    umbral_revision = umb["revisar_dia"]   if en_turno else math.inf
+    if p >= umbral_bloqueo:
+        return "bloquear"
+    if p >= umbral_revision:
+        return "revisar"
+    return "aprobar"
+```
+
+Key rules:
+
+- **Hard blacklist** (`lista_negra_dura=True`) forces `bloquear` unconditionally, before any threshold comparison.
+- **During shift** (08:00–22:00 Chile local time): three zones — `aprobar`, `revisar`, and `bloquear` — are active, separated by `revisar_dia` and `bloquear_dia` thresholds.
+- **Outside shift** (22:00–08:00): the `revisar` zone collapses — there are no human reviewers — and only `bloquear_noche` applies. Transactions below that threshold go directly to `aprobar`.
+
+## Explainability
+
+For each prediction the service returns the **top 3 factors** ranked by absolute contribution to the log-odds shift, scaled by the Platt `a` coefficient:
+
+```python
+delta = (aportes - np.array(meta["aportes_base"])) * calib["a"]
+for idx in np.argsort(-np.abs(delta))[:3]:
+    nombre = meta["factores"][idx]
+    razones.append(RazonExplicabilidad(
+        factor=nombre,
+        descripcion=f"Aporte del factor {nombre}",
+        valor=_limpio(df_feat[nombre].iloc[0]) if nombre in df_feat.columns else None,
+        aporte_logodds=round(float(delta[idx]), 3),
+        efecto="sube el riesgo" if delta[idx] > 0 else "baja el riesgo"
+    ))
+```
+
+Each reason in the response carries:
+
+| Field | Description |
+|---|---|
+| `factor` | Feature name (e.g. `nivel_kyc`, `intentos_previos_1h`) |
+| `descripcion` | Human-readable label |
+| `valor` | Actual value seen for this transaction |
+| `aporte_logodds` | Signed contribution to log-odds (positive = raises risk) |
+| `efecto` | `"sube el riesgo"` or `"baja el riesgo"` |
+
+## Endpoints
+
+| Endpoint | Description |
+|---|---|
+| `GET /health` | Returns 200 + version string when the model is loaded; 503 otherwise |
+| `POST /predict` | Scores a transaction; returns `PrediccionResponse` |
+
+### Sample `/health` response
+
+```json
+{
+  "status": "healthy",
+  "servicio": "microservicio-ia",
+  "version_modelo": "v2.1.0"
+}
+```
+
+### Sample `/predict` response
+
+```json
+{
+  "transaccion_id": "TXN-A1B2C3D4E5F6",
+  "decision": "revisar",
+  "probabilidad_fraude": 0.61482,
+  "razones": [
+    {
+      "factor": "intentos_previos_1h",
+      "descripcion": "Aporte del factor intentos_previos_1h",
+      "valor": 4,
+      "aporte_logodds": 1.203,
+      "efecto": "sube el riesgo"
+    },
+    {
+      "factor": "nivel_kyc",
+      "descripcion": "Aporte del factor nivel_kyc",
+      "valor": 0.0,
+      "aporte_logodds": 0.841,
+      "efecto": "sube el riesgo"
+    },
+    {
+      "factor": "emulador",
+      "descripcion": "Aporte del factor emulador",
+      "valor": 1.0,
+      "aporte_logodds": 0.732,
+      "efecto": "sube el riesgo"
+    }
+  ],
+  "version_modelo": "v2.1.0",
+  "version_umbrales": "u1.0",
+  "latencia_ms": 14.27,
+  "regla_aplicada": null
+}
+```
+
+## Replicas and resource limits
+
+Two replicas are declared in `compose.yaml`:
+
+```yaml
+ia:
+  deploy:
+    replicas: 2
+  cpus: 0.50
+  mem_limit: 512m
+```
+
+Each replica gets its own ONNX Runtime session. The gateway's `ia_up` upstream automatically discovers both IP addresses from Docker DNS and routes between them. If one replica fails its health check, the gateway excludes it for 10 seconds and the second replica handles 100% of traffic until the first recovers.
+
+| Resource | Per replica |
+|---|---|
+| CPU | 0.50 cores |
+| Memory | 512 MB |
+
+<Note>
+Two environment variables control inference behavior at runtime:
+
+- **`RUTA_MODELO`** — absolute path to the directory containing `modelo.onnx`, `preprocesador.joblib`, `metadata.json`, and `umbrales.json`. Defaults to `./model` relative to `main.py` inside the container image.
+- **`ORT_THREADS`** — number of ONNX Runtime intra-op threads per session. Defaults to `1`. Increasing this can reduce tail latency under sustained load, but each request will consume more CPU — monitor `docker stats` before raising it above `1` on a shared host.
+</Note>

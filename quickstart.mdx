@@ -1,47 +1,176 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Guardián Centinela in Minutes"
+sidebarTitle: "Quickstart"
+description: "Deploy the full Guardián Centinela fraud detection stack locally using Docker Compose and evaluate your first transaction in under five minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+Guardián Centinela is a real-time fraud detection system built for Kipu Pagos. It consists of six containerized services — a gateway, a frontend dashboard, a domain API, two IA inference replicas, a database, and a one-shot data loader — all wired together through a single Docker Compose project. This guide walks you from zero to your first fraud evaluation in under five minutes.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+### Check prerequisites
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+You need two things on your machine before starting:
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
-</Steps>
+- **Docker Engine** with the **Docker Compose v2** plugin (`docker compose version` should print `v2.x` or later).
+- **Port 8080** must be free. The gateway is the only service that publishes a port, and it binds to `0.0.0.0:8080`.
+
+No other ports are exposed — all inter-service traffic runs on an isolated internal bridge network called `interna`.
+
+### Clone the repository and create your `.env` file
+
+```bash
+git clone https://github.com/ser-martinezs/deteccion-fraude-kipu.git
+cd deteccion-fraude-kipu
+cp .env.example .env
+```
+
+The `.env.example` file ships with three variables that cover the most common local customisations:
+
+```ini .env.example
+POSTGRES_PASSWORD=kipu_local
+IA_TIMEOUT_MS=500
+POLITICA_RESERVA=reglas
+```
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `POSTGRES_PASSWORD` | `kipu_local` | Password for the `kipu` PostgreSQL user |
+| `IA_TIMEOUT_MS` | `500` | Milliseconds the domain service waits for the IA before falling back |
+| `POLITICA_RESERVA` | `reglas` | Fallback decision policy when IA is unavailable (`reglas` \| `aprobar` \| `bloquear`) |
+
+The defaults are intentionally safe for local development. See the [Configuration](/configuration) reference for every available variable.
+
+### Pull the images and start the stack
+
+Pull all pre-built images from GHCR, then start the project with the name `equipoNN` (required by the course marking rubric):
+
+```bash
+docker compose -p equipoNN pull
+docker compose -p equipoNN up -d
+```
+
+Docker Compose respects the `depends_on` conditions declared in `compose.yaml`, so services start in this order:
+
+1. **`db`** — PostgreSQL 16 starts first; healthcheck polls `pg_isready` every 5 s.
+2. **`carga`** — runs once the database is healthy; seeds users, devices, and the block-list, then exits with code 0.
+3. **`dominio`** and **`ia`** — start in parallel once both `db` is healthy and `carga` has completed successfully.
+4. **`front`** and **`gateway`** — come up last, after `dominio` and `ia` are healthy.
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
-
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+The `carga` service is designed to run exactly once and exit normally. Docker Compose will show its status as **`Exited (0)`** — this is expected and not an error. Its seed queries use `ON CONFLICT DO NOTHING`, so restarting the stack never duplicates data.
 </Tip>
+
+### Wait for all services to become healthy
+
+After `up -d` returns, poll the stack status until every long-running service shows `(healthy)`:
+
+```bash
+docker compose -p equipoNN ps
+```
+
+A fully ready stack looks like this:
+
+```
+NAME                          IMAGE                                          STATUS
+equipoNN-db-1                 postgres:16-alpine                             Up 30s (healthy)
+equipoNN-carga-1              ghcr.io/ser-martinezs/servicio-carga:ep2       Exited (0)
+equipoNN-ia-1                 ghcr.io/ser-martinezs/servicio-ia:ep2          Up 25s (healthy)
+equipoNN-ia-2                 ghcr.io/ser-martinezs/servicio-ia:ep2          Up 25s (healthy)
+equipoNN-dominio-1            ghcr.io/ser-martinezs/servicio-dominio:ep2     Up 20s (healthy)
+equipoNN-front-1              ghcr.io/ser-martinezs/servicio-front:ep2       Up 15s (healthy)
+equipoNN-gateway-1            ghcr.io/ser-martinezs/servicio-gateway:ep2     Up 10s (healthy)
+```
+
+The `ia` service has a `start_period` of 20 s because it loads the ONNX model on startup — give it a few extra seconds if it stays in `starting` state initially.
+
+### Evaluate a test transaction
+
+Send a `POST` request to the domain service through the gateway. The endpoint is `/api/dominio/evaluar` and it accepts a `Transaccion` JSON body.
+
+<CodeGroup>
+
+```bash curl
+curl -s -X POST http://localhost:8080/api/dominio/evaluar \
+  -H "Content-Type: application/json" \
+  -d '{
+    "usuario_id": "USR-0001",
+    "comercio_id": "COM-001",
+    "monto": 24990,
+    "moneda": "CLP",
+    "canal": "app",
+    "mcc": "5411",
+    "pais_transaccion": "CL"
+  }' | jq .
+```
+
+```python Python
+import httpx, json
+
+payload = {
+    "usuario_id": "USR-0001",
+    "comercio_id": "COM-001",
+    "monto": 24990,
+    "moneda": "CLP",
+    "canal": "app",
+    "mcc": "5411",
+    "pais_transaccion": "CL",
+}
+
+r = httpx.post("http://localhost:8080/api/dominio/evaluar", json=payload)
+print(json.dumps(r.json(), indent=2, ensure_ascii=False))
+```
+
+</CodeGroup>
+
+Required fields are `usuario_id`, `comercio_id`, `monto`, `moneda`, `canal`, `mcc`, and `pais_transaccion`. All other fields (`dispositivo_id`, `ip`, `tarjeta_enmascarada`, `intentos_previos_1h`, `timestamp`) are optional.
+
+### Interpret the response
+
+A successful evaluation returns a JSON object like this:
+
+```json
+{
+  "prediccion_id": 1,
+  "transaccion_id": "TXN-A3F9C2E1B804",
+  "decision": "aprobar",
+  "origen": "modelo",
+  "probabilidad_fraude": 0.00312,
+  "razones": [
+    {
+      "tipo": "modelo",
+      "factor": "monto_usd",
+      "descripcion": "Aporte del factor monto_usd",
+      "valor": 26.3,
+      "aporte_logodds": -0.812,
+      "efecto": "baja el riesgo"
+    }
+  ],
+  "version_modelo": "v2.1.0",
+  "version_umbrales": "v1.0.0",
+  "usuario_conocido": true,
+  "latencia_ms": 18.43,
+  "desglose_ms": {
+    "base_de_datos": 4.21,
+    "ia": 12.87
+  },
+  "fecha_utc": "2025-01-15T14:32:07.841000+00:00"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `prediccion_id` | integer | Auto-incremented primary key of the stored decision |
+| `transaccion_id` | string | Echoed back (or auto-generated as `TXN-<hex>` if omitted) |
+| `decision` | string | `"aprobar"`, `"revisar"`, or `"bloquear"` |
+| `origen` | string | `"modelo"` — IA responded; `"reserva"` — fallback policy was used; `"regla_dura"` — block-list override |
+| `probabilidad_fraude` | float | Calibrated fraud probability from the ONNX model (0–1) |
+| `razones` | array | Top-3 feature contributions from the model, plus any block-list or fallback entries |
+| `version_modelo` | string | Model artefact version that produced this decision |
+| `latencia_ms` | float | Wall-clock time from request receipt to response |
+
+### Open the dashboard
+
+Navigate to [http://localhost:8080](http://localhost:8080) in your browser to access the Guardián Centinela frontend. The dashboard lets you submit transactions through a form, browse recent decisions, and inspect the evaluation history for individual transactions.
+
+</Steps>

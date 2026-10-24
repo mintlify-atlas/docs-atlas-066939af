@@ -1,0 +1,75 @@
+---
+title: "Feature Engineering: 21 Variables for Fraud Detection"
+sidebarTitle: "Feature Engineering"
+description: "The 21 numeric and categorical features engineered by construir_variables() in preparar.py, with their source columns, calculation logic, and the columns excluded to prevent data leakage."
+---
+
+All 21 model features are calculated by `construir_variables()` in `datos/preparar.py`. This function is **shared with the inference service** — it is not duplicated. When a payment arrives at the API, the same function processes it in real time using the same logic that produced the training data. There is no training/serving skew by construction.
+
+`construir_variables()` performs a left join of transactions → users → devices, then computes each feature from the joined row. Transactions without a matching user profile or device record are kept; their profile-derived features become null and are imputed by the model preprocessor at runtime (see [Cleaning Rule R19](/data/cleaning-rules)).
+
+## Numeric Features (15)
+
+| # | Feature | Source | Calculation |
+|---|---|---|---|
+| 1 | `log_monto_usd` | `transacciones.monto`, `moneda` | `log(1 + monto_usd)`. CLP amounts are divided by 950 (fixed exchange rate) before taking the log. Currency is inferred when missing (R07). The log transform compresses the long right tail of transaction amounts. |
+| 2 | `hora_local` | `transacciones.timestamp` | Hour of day (0–23) in Chile local time, computed as `ts_utc − 4 hours`. The UTC offset is fixed at −4 (Chile Standard Time, no DST adjustment). |
+| 3 | `es_madrugada` | `transacciones.timestamp` | `1` if `hora_local < 6`, else `0`. Approximately 49% of labeled fraud in the training set occurs between 00:00 and 06:00, when analyst coverage is minimal. |
+| 4 | `intentos_previos_1h` | `transacciones.intentos_previos_1h` | Used as-is from the source column. This value is computed by the core payment system over **all** traffic in real time. Recomputing it from the stratified sample would produce a biased estimate. Left as null if absent. |
+| 5 | `nivel_kyc` | `usuarios.nivel_kyc` | Integer 0–3 representing KYC verification level. Values outside this range (e.g., `−1`) become null per R12. |
+| 6 | `verificado` | `usuarios.verificado` | Binary 0/1 after normalizing `si/no/TRUE/FALSE/1/0` via the `BOOL` equivalence table (R03). |
+| 7 | `telefono_verificado` | `usuarios.telefono_verificado` | Binary 0/1 from the source column, cast to float. |
+| 8 | `dominio_desechable` | `usuarios.email_dominio` | `1` if the user's email domain is in the disposable-email list (`mailinator.com`, `guerrillamail.com`, `tempmail.io`, `10minutemail.com`). `null` if the user has no email on record. |
+| 9 | `edad_cuenta_dias` | `usuarios.fecha_registro`, `transacciones.timestamp` | `(ts_utc − fecha_registro)` in integer days. Negative values (registration date after transaction date — impossible) are set to null. The snapshot `edad_cuenta_dias` column from the CSV is dropped and never used (R13). |
+| 10 | `emulador` | `dispositivos.emulador` | Binary 0/1 tag provided by the client SDK. `1` indicates the transaction came from an emulated device. |
+| 11 | `pais_distinto_usuario` | `transacciones.pais_transaccion`, `usuarios.pais` | `1` if the transaction country differs from the user's registered country; `0` if they match; `null` if the user has no profile (left join produced no match). |
+| 12 | `pais_distinto_dispositivo` | `transacciones.pais_transaccion`, `dispositivos.pais_declarado` | `1` if the transaction country differs from the device's declared country; `0` if they match; `null` if there is no device record. |
+| 13 | `ip_ausente_o_invalida` | `transacciones.ip` | `1` if the IP is missing or failed the four-octet / 0–255 validation check (R11). The absence of a valid IP is an independent fraud signal. |
+| 14 | `dispositivo_ausente` | `transacciones.dispositivo_id` | `1` if `dispositivo_id` is null in the transaction row. A payment with no device identifier is abnormal for app and POS channels. |
+| 15 | `lista_negra_interna` | `lista_negra` + `transacciones.ip`, `dispositivo_id`, `comercio_id`, `tarjeta_enmascarada` | `1` if the transaction matches an **active, non-hard** blocklist entry that was already present (its `fecha_alta` ≤ transaction date). Hard entries (compliance-mandated blocks) drive `lista_negra_dura`, which is a hard rule — not a model feature. |
+
+## Categorical Features (6)
+
+| # | Feature | Source | Values |
+|---|---|---|---|
+| 16 | `moneda_final` | `transacciones.moneda`, `monto` | `CLP` or `USD`. Inferred from amount when the source column is empty (R07). |
+| 17 | `canal` | `transacciones.canal` | `app`, `web`, `pos`, `api`. Normalized from aliases like `movil` → `app` and `punto_venta` → `pos` (R03). |
+| 18 | `pais_tx` | `transacciones.pais_transaccion` | Two-letter ISO country code. Normalized from free-text forms like `chile` → `CL`, `brasil` / `brazil` → `BR` (R03). |
+| 19 | `segmento` | `usuarios.segmento` | `persona`, `comercio_pequeno`, `comercio_grande`. Aliases `individuo` and `pyme` are normalized (R03). |
+| 20 | `tipo_dispositivo` | `dispositivos.tipo` | `android`, `ios`, `web`, `pos`. |
+| 21 | `mcc` | `transacciones.mcc` | Merchant Category Code, used as a categorical string. High-cardinality categories not seen during training are handled by `OneHotEncoder(handle_unknown="ignore")`. |
+
+## Integration Strategy
+
+`construir_variables()` joins the three normalized tables with left joins, anchored on transactions:
+
+```
+transactions
+  LEFT JOIN usuarios ON usuario_id
+  LEFT JOIN dispositivos ON dispositivo_id
+```
+
+This means:
+- A transaction without a user profile keeps all transaction-level features; `nivel_kyc`, `verificado`, `telefono_verificado`, `dominio_desechable`, `edad_cuenta_dias`, `segmento`, `pais_distinto_usuario` become null.
+- A transaction without a device record keeps all transaction-level and user-level features; `emulador`, `tipo_dispositivo`, `pais_distinto_dispositivo` become null.
+- `dispositivo_ausente = 1` is always set when `dispositivo_id` is null — it is not merely a null-propagation artifact, it is an intentional signal.
+
+Nulls from missing profiles flow through to `variables_modelo.csv` unchanged. The sklearn `ColumnTransformer` in `entrenar.py` imputes numeric nulls with the training-set median plus a missing indicator, and imputes categorical nulls with the constant `"desconocido"`. The fitted preprocessor is serialized as `preprocesador.joblib` and used identically at inference time.
+
+## Excluded Columns
+
+The following columns are explicitly **not** features. They are documented in the `EXCLUIDAS` list in `preparar.py`.
+
+| Column(s) | Reason |
+|---|---|
+| `es_fraude` | The target label — not an input feature. |
+| `revisado_por_analista`, `motivo_bloqueo` | Filled after the fraud verdict. Including them would be direct data leakage (R17). |
+| `resultado_autorizacion` | Does not exist at the moment the model must decide — the authorization result is the output of the system, not an input. |
+| `edad_cuenta_dias` (CSV snapshot), `transacciones_previas`, `dispositivos.usuarios_distintos` | Snapshot values calculated at the data export cut-off date. They include future information relative to historical transactions (R13). |
+| `tarjeta_enmascarada` | A PCI-DSS-controlled identifier. Used only by the blocklist lookup rule; never seen by the model. |
+| `usuario_id`, `transaccion_id`, `comercio_id`, `dispositivo_id` | Identifiers. A model trained on IDs memorizes specific entities rather than learning generalizable patterns. |
+| `latitud`, `longitud`, `ip` | Noisy in this version (high null rate, coarse precision). The IP contributes only as the binary `ip_ausente_o_invalida`. Coordinates may be added in a future version once geo-feature engineering is validated. |
+
+<Note>
+  The categorical features are passed to the preprocessor as Python `object`-type Series (string or `NaN`), matching exactly the dtype that the inference service sends. The `OneHotEncoder` uses `handle_unknown="ignore"` so a new MCC code or country code seen only in production produces a zero vector rather than an error.
+</Note>

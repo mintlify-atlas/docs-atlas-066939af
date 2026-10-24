@@ -1,0 +1,231 @@
+---
+title: "Train the Fraud Detection Model with entrenar.py"
+sidebarTitle: "Training"
+description: "How to train, calibrate, and export the Guardián Centinela NAM fraud model using entrenar.py, including the quality gate, Platt calibration, threshold search, and ONNX export."
+---
+
+`servicio-ia/entrenar.py` takes the treated data produced by `datos/preparar.py` and produces a trained, calibrated, evaluated, and exported fraud model. It never touches raw CSVs — all data decisions live in `preparar.py`. If `entrenar.py` exits with code 0, the CI pipeline proceeds to build the Docker image. Any other exit code blocks the build.
+
+## Architecture: Neural Additive Model (NAM)
+
+The model is a **Neural Additive Model (NAM)**. The design principle is that exact per-factor explanations are required by the risk team for every real-time decision (ADR-2, RF2).
+
+A NAM achieves this without approximation. The architecture works as follows:
+
+- One small fully-connected subnetwork is trained for each input factor (a feature or its missing indicator).
+- Each subnetwork maps its factor's value(s) to a scalar **contribution** (an additive logit term).
+- The final logit is the **sum** of all contributions: `logit = Σ contribution_i`.
+- The probability is `sigmoid(logit)`.
+
+Because logit is a literal sum of independent subnetwork outputs, the contribution of any single factor to the final score is exact — not an approximation, not a SHAP estimate. The inference service returns both the probability and the vector of per-factor contributions in every response.
+
+The subnetworks use two hidden layers (sizes 16 and 8) with ReLU activations and L2 regularization (`l2=1e-4`). Weights are initialized with seed 42 for reproducibility.
+
+## Training Steps
+
+<Steps>
+  <Step title="Load variables_modelo.csv">
+    `entrenar.py` reads `variables_modelo.csv` and `variables.json` from the `--tratado` directory. The train/validation/test split is already encoded in the `split` column — `entrenar.py` reads it directly and never re-splits. If any split is empty, the script exits with code 2.
+
+    ```bash
+    python servicio-ia/entrenar.py --tratado datos/tratado --salida servicio-ia/model
+    ```
+  </Step>
+
+  <Step title="Fit the sklearn ColumnTransformer preprocessor on the training set only">
+    A `ColumnTransformer` is fitted exclusively on the training rows. It applies two pipelines:
+
+    - **Numeric pipeline:** `SimpleImputer(strategy="median", add_indicator=True)` followed by `StandardScaler`. Each null value is replaced with the training-set median, and a binary `missingindicator_<feature>` column is added so the model knows the value was absent.
+    - **Categorical pipeline:** `SimpleImputer(strategy="constant", fill_value="desconocido")` followed by `OneHotEncoder(handle_unknown="ignore", sparse_output=False)`.
+
+    The fitted preprocessor is applied to validation and test sets without re-fitting. It is later serialized to `preprocesador.joblib` and used identically at inference time.
+  </Step>
+
+  <Step title="Train the NAM with TensorFlow/Keras">
+    The NAM is trained with binary cross-entropy loss and the Adam optimizer (learning rate `3e-3`, batch size 256). Sample weights assign confirmed fraud rows a weight of **20×** (`PESO_FRAUDE = 20.0`) and unlabeled rows a weight of **1×** (`PESO_NO_REVISADAS = 1.0`).
+
+    Training runs in blocks of 10 epochs. After each block the PR-AUC (production-weighted) on the validation set is printed. The model weights at the best validation PR-AUC across all blocks are retained:
+
+    ```
+       época  10 · PR-AUC (producción) en validación 0.312
+       época  20 · PR-AUC (producción) en validación 0.381
+       ...
+       época 100 · PR-AUC (producción) en validación 0.467
+    ```
+
+    A logistic regression baseline is also trained on the same preprocessed features and evaluated for comparison. It serves as a performance floor — the NAM must beat it.
+  </Step>
+
+  <Step title="Platt calibration with production prior correction">
+    Raw NAM probabilities reflect the fraud prevalence in the training sample (~0.5%). In production, fraud occurs at ~0.012% (`PI_PROD = 0.00012`). Deploying without correction would produce scores that are roughly 40× too high, pushing borderline transactions above block thresholds.
+
+    Calibration is performed on the validation set using Platt scaling: a logistic regression `a·logit(p) + b` is fitted on validation predictions. A prior correction term is then added:
+
+    ```
+    log_razon_prior = log(PI_PROD / (1 - PI_PROD)) - log(PI_sample / (1 - PI_sample))
+    calibrated_logit = a · logit(p_raw) + b + log_razon_prior
+    p_calibrated = sigmoid(calibrated_logit)
+    ```
+
+    Calibration parameters (`a`, `b`, `log_razon_prior`, `pi_muestra_validacion`, `pi_produccion`) are stored in `metadata.json`.
+  </Step>
+
+  <Step title="Threshold search: minimize annual cost subject to operational constraints">
+    Decision thresholds are searched over the validation set after calibration. The search optimizes for minimum projected annual cost (fraud losses + FP block costs + manual review costs), subject to:
+
+    - **Reviews ≤ 4,800 / day** (analyst capacity, daytime shift 08:00–22:00)
+    - **FP rate on blocks ≤ 15%** (at most 15% of blocked transactions can be legitimate)
+
+    Three thresholds are produced:
+
+    | Threshold | Used when | Meaning |
+    |---|---|---|
+    | `revisar_dia` | Daytime (08:00–22:00) | Score ≥ this → queue for analyst review |
+    | `bloquear_dia` | Daytime (08:00–22:00) | Score ≥ this → block immediately |
+    | `bloquear_noche` | Overnight (22:00–08:00) | Score ≥ this → block (no review queue overnight) |
+
+    During overnight hours the review zone collapses: there are no analysts to review before funds settle, so all flagged transactions are either blocked or approved directly.
+
+    If no threshold combination satisfies both constraints simultaneously, the script logs a warning, relaxes the FP constraint, and selects the point of minimum cost within the capacity constraint.
+  </Step>
+
+  <Step title="Quality gate: measure on test set, fail with exit code 1 if below thresholds">
+    All metrics are computed on the held-out test set. The quality gate thresholds are read from `calidad.json` (configurable via `--calidad`):
+
+    | Metric | Minimum | Notes |
+    |---|---|---|
+    | `roc_auc` | **0.96** | Computed on raw (uncalibrated) NAM scores vs. `y` |
+    | `pr_auc_prod` | **0.45** | Precision-Recall AUC with production-day weights (`pesos_dia`) |
+    | Fraud cases in test set | **20** | Below this count, the metric is not statistically reliable |
+
+    If any threshold is missed, the script prints the failures to stderr and exits with code 1. **No artifacts are written.** The CI pipeline does not proceed.
+
+    ```
+      métrica sobre PRUEBA            red aditiva    LogReg (ref.)   mínimo del equipo
+      roc_auc                               0.971          0.984             0.96
+      pr_auc_prod                           0.481          0.530             0.45
+      costo anual proyectado (USD)        842,300        921,400
+      (44 fraudes en prueba: diferencias pequeñas no son diferencias)
+    ```
+  </Step>
+
+  <Step title="Export model artifacts to servicio-ia/model/">
+    If the quality gate passes, artifacts are written atomically: first to a `.tmp` directory, then renamed to the target path in a single `rename()` call. This prevents the inference service from loading a partially-written model.
+
+    Files written:
+    - `model.onnx` — the exported NAM (two outputs: probability scalar + contributions vector)
+    - `preprocesador.joblib` — fitted sklearn `ColumnTransformer`
+    - `metadata.json` — version, feature list, calibration params, training metrics, and data provenance
+    - `umbrales.json` — the three decision thresholds (proposed; requires risk-team authorization)
+  </Step>
+</Steps>
+
+## CLI Reference
+
+```bash
+python servicio-ia/entrenar.py [OPTIONS]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--tratado` | `datos/tratado` | Directory containing `variables_modelo.csv` and `variables.json` from `preparar.py` |
+| `--salida` | `servicio-ia/model` | Output directory for model artifacts |
+| `--calidad` | `servicio-ia/calidad.json` | Quality gate thresholds file |
+| `--informe` | `servicio-ia/reporte_entrenamiento.json` | Full training report (written regardless of gate result) |
+| `--version` | `2.0.0` | Model version string written to `metadata.json` and `umbrales.json` |
+| `--epocas` | `100` | Total training epochs for the NAM |
+
+## Quality Gate Thresholds
+
+Thresholds are defined in `servicio-ia/calidad.json` and are a team decision tracked in git history.
+
+```json
+{
+  "descripcion": "Umbrales mínimos de calidad fijados por el equipo. El job de la imagen de IA NO construye la imagen si el modelo entrenado queda por debajo en el conjunto de PRUEBA.",
+  "roc_auc_min": 0.96,
+  "pr_auc_prod_min": 0.45,
+  "fraudes_prueba_min": 20,
+  "nota": "Punto de partida: un poco bajo la regresión logística de referencia (ROC-AUC 0,984 / PR-AUC re-ponderada a producción 0,53) para no bloquear por ruido, ya que la prueba tiene ~44 fraudes. Subir estos valores después de las primeras corridas reales con TensorFlow."
+}
+```
+
+<Tip>
+  The starting thresholds are deliberately set slightly below the logistic regression baseline to avoid blocking the build due to noise when the test set has only ~44 fraud cases. Raise `roc_auc_min` and `pr_auc_prod_min` after confirming stable results across multiple full training runs with TensorFlow.
+</Tip>
+
+## Exit Codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Quality gate passed; all artifacts exported to `--salida` |
+| `1` | Quality gate failed; no artifacts written; CI blocks the image build |
+| `2` | Missing or invalid input files (e.g., `preparar.py` was not run first) |
+| `3` | TensorFlow / Keras not installed in the current environment |
+
+## Output Model Artifacts
+
+### `model.onnx`
+
+The exported NAM in ONNX format. The model has two outputs:
+- **`prob`** — a scalar probability of fraud, calibrated to production prevalence
+- **`aportes`** — a vector of per-factor logit contributions (one value per input factor), enabling exact attribution without post-hoc approximation
+
+The inference service loads this file with `onnxruntime` using the CPU execution provider.
+
+### `preprocesador.joblib`
+
+The fitted sklearn `ColumnTransformer` containing:
+- Numeric: median imputation + missing indicator + standard scaler
+- Categorical: constant imputation (`"desconocido"`) + one-hot encoding
+
+The preprocessor must be applied to raw feature vectors before passing them to the ONNX model. It is fitted only on training data; applying it to validation or test data does not re-fit.
+
+### `metadata.json`
+
+A JSON document containing:
+- Model version and training timestamp
+- Framework version (TensorFlow)
+- `variables_numericas` and `variables_categoricas` lists
+- `factores` — the ordered list of NAM subnetwork names (matches the contribution vector)
+- `aportes_base` — mean per-factor contribution over the training set (used for attribution baseline)
+- `calibracion` — Platt calibration parameters (`a`, `b`, `log_razon_prior`, `pi_muestra_validacion`, `pi_produccion`)
+- Full training metrics and logistic regression reference metrics
+- Data provenance from `manifiesto.json` (SHA-256 hashes of training inputs)
+
+### `umbrales.json`
+
+The three decision thresholds and their operational context:
+
+```json
+{
+  "version": "u-0001",
+  "version_modelo": "2.0.0",
+  "umbrales": {
+    "revisar_dia": 0.0021,
+    "bloquear_dia": 0.0089,
+    "bloquear_noche": 0.0034
+  },
+  "unidad": "probabilidad de fraude EN PRODUCCIÓN (ya calibrada)",
+  "reglas_duras": ["lista_negra:solicitud_cumplimiento"],
+  "creado_por": "servicio-ia/entrenar.py (propuesta)",
+  "autorizado_por": "PENDIENTE: gerencia de riesgo (DA5 / RO5)"
+}
+```
+
+<Warning>
+  `umbrales.json` produced by `entrenar.py` is a **proposal**. It must be reviewed and authorized by the risk management team before deployment (ADR-3). The `autorizado_por` field ships as `"PENDIENTE"` and must be updated with the approver's name and date before the artifact is promoted to production. Deploying with an unauthorized thresholds file violates the operational governance policy.
+</Warning>
+
+## ONNX Verification
+
+After exporting, `entrenar.py` runs an automatic verification step. It loads the ONNX file with `onnxruntime` and compares its outputs against the Keras model on the test set:
+
+- Maximum absolute difference in predicted probability: must be `< 1e-4`
+- Maximum absolute difference in per-factor contributions: must be `< 1e-3`
+
+If either check fails, a `RuntimeError` is raised and the `.tmp` directory is never renamed — the previous production artifact is not overwritten. This ensures the ONNX export faithfully reproduces the trained network before it replaces the live model.
+
+```
+ONNX verificado: diferencia máxima en probabilidad 3.1e-06 y en aportes 8.7e-05
+Modelo exportado en servicio-ia/model (metadata.json, model.onnx, preprocesador.joblib, umbrales.json) · 142.3 s
+```

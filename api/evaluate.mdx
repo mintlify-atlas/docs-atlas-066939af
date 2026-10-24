@@ -1,0 +1,221 @@
+---
+title: "POST /evaluar — Evaluate a Transaction for Fraud"
+sidebarTitle: "POST /evaluar"
+description: "POST /api/dominio/evaluar — submits a payment transaction, enriches it with user and device profiles, scores it with the NAM model, and returns an approve/review/block decision."
+---
+
+The `/evaluar` endpoint is the core of Guardián Centinela. It accepts a payment transaction, pulls the corresponding user and device profiles from the database, checks the active blocklist (RF8), forwards the enriched payload to the NAM fraud-scoring model, and returns a structured decision — `aprobar`, `revisar`, or `bloquear` — along with a calibrated fraud probability and human-readable reasons. Every call is persisted to the `predicciones` table for audit and replay (RF7).
+
+**Base URL (via gateway):** `http://localhost:8080/api/dominio/evaluar`
+
+**Method:** `POST` — `Content-Type: application/json`
+
+## Request body
+
+<ParamField body="transaccion_id" type="string">
+  Optional. A caller-supplied identifier for this transaction (max 40 characters). If omitted the service auto-generates one as `TXN-{12-char uppercase hex}` (e.g. `TXN-3FA2C8D91B04`).
+</ParamField>
+
+<ParamField body="usuario_id" type="string" required>
+  The platform user identifier. Must be between 3 and 20 characters.
+</ParamField>
+
+<ParamField body="comercio_id" type="string" required>
+  The merchant identifier. Must be between 2 and 20 characters.
+</ParamField>
+
+<ParamField body="dispositivo_id" type="string">
+  Optional. The device identifier (max 40 characters). When provided, the service looks up the device profile and includes it in the fraud score.
+</ParamField>
+
+<ParamField body="monto" type="number" required>
+  Transaction amount. Must be greater than `0` and at most `500,000,000`.
+</ParamField>
+
+<ParamField body="moneda" type="string" required>
+  Currency code. Accepted values: `"CLP"` or `"USD"`. CLP amounts are converted to USD at a fixed rate of 950 for rule evaluation.
+</ParamField>
+
+<ParamField body="canal" type="string" required>
+  The channel through which the transaction was initiated. Accepted values: `"app"`, `"web"`, `"pos"`, or `"api"`.
+</ParamField>
+
+<ParamField body="mcc" type="string" required>
+  Merchant Category Code — exactly 4 decimal digits (pattern `^\d{4}$`), e.g. `"5411"` for grocery stores.
+</ParamField>
+
+<ParamField body="pais_transaccion" type="string" required>
+  Two-letter ISO 3166-1 alpha-2 country code where the transaction occurred (e.g. `"CL"`, `"US"`). The value is automatically uppercased before processing.
+</ParamField>
+
+<ParamField body="ip" type="string">
+  Optional. The originating IPv4 address. Used for blocklist lookups when present.
+</ParamField>
+
+<ParamField body="tarjeta_enmascarada" type="string">
+  Optional. A masked card identifier in the format `****NNNN` (e.g. `"****4242"`). **Any value containing 13–19 consecutive digits is rejected with HTTP 422** (PCI-DSS / RNF5 — full PANs never enter the system).
+</ParamField>
+
+<ParamField body="intentos_previos_1h" type="integer">
+  Optional. Number of previous transaction attempts by this user in the last hour. Accepted range: `0`–`100`. Used by the fallback rules engine when the IA service is unavailable.
+</ParamField>
+
+<ParamField body="timestamp" type="string">
+  Optional. ISO 8601 datetime string representing when the transaction occurred (e.g. `"2024-11-15T14:30:00Z"`). Defaults to the server's current UTC time when omitted.
+</ParamField>
+
+## Response — 200 OK
+
+<ResponseField name="prediccion_id" type="integer">
+  Auto-incremented primary key of the recorded decision in the `predicciones` table.
+</ResponseField>
+
+<ResponseField name="transaccion_id" type="string">
+  The transaction identifier — either the caller-supplied value or the auto-generated `TXN-…` string.
+</ResponseField>
+
+<ResponseField name="decision" type="string">
+  The fraud decision outcome. One of:
+  - `"aprobar"` — transaction is approved
+  - `"revisar"` — transaction is flagged for manual review
+  - `"bloquear"` — transaction is blocked
+</ResponseField>
+
+<ResponseField name="origen" type="string">
+  Indicates which system produced the decision:
+  - `"modelo"` — the NAM machine-learning model scored the transaction
+  - `"regla_dura"` — a hard compliance rule (blocklist) forced the outcome
+  - `"reserva"` — the IA service was unavailable; the fallback rules engine was used
+</ResponseField>
+
+<ResponseField name="probabilidad_fraude" type="number">
+  Calibrated probability of fraud, in the range `[0, 1]`. `null` when `origen` is `"reserva"` (model was not reachable).
+</ResponseField>
+
+<ResponseField name="razones" type="array">
+  List of reason objects explaining the decision.
+
+  <Expandable title="Reason object fields">
+    <ResponseField name="tipo" type="string">
+      Source of the reason: `"modelo"`, `"regla"`, or `"reserva"`.
+    </ResponseField>
+    <ResponseField name="factor" type="string">
+      Machine-readable feature or rule name (e.g. `"lista_negra_dispositivo"`, `"monto_alto"`, `"politica_reserva"`).
+    </ResponseField>
+    <ResponseField name="descripcion" type="string">
+      Human-readable explanation of why this reason applies.
+    </ResponseField>
+    <ResponseField name="aporte_logodds" type="number">
+      *(Model reasons only.)* The feature's contribution to the log-odds score. Positive values increase fraud probability.
+    </ResponseField>
+    <ResponseField name="efecto" type="string">
+      *(Model reasons only.)* Direction of the contribution: `"aumenta_riesgo"` or `"reduce_riesgo"`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="version_modelo" type="string | null">
+  Identifier of the NAM model version that produced the score. `null` when `origen` is `"reserva"`.
+</ResponseField>
+
+<ResponseField name="version_umbrales" type="string | null">
+  Identifier of the threshold configuration used to convert the probability into a decision. `null` when `origen` is `"reserva"`.
+</ResponseField>
+
+<ResponseField name="usuario_conocido" type="boolean">
+  `true` if the `usuario_id` was found in the `usuarios` table; `false` for unknown users.
+</ResponseField>
+
+<ResponseField name="latencia_ms" type="number">
+  Total end-to-end processing time for the request, in milliseconds.
+</ResponseField>
+
+<ResponseField name="desglose_ms" type="object">
+  Per-stage latency breakdown.
+
+  <Expandable title="desglose_ms fields">
+    <ResponseField name="base_de_datos" type="number">
+      Time spent reading user, device, and blocklist data from PostgreSQL, in milliseconds.
+    </ResponseField>
+    <ResponseField name="ia" type="number">
+      Time spent calling the IA microservice (or detecting its unavailability), in milliseconds.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="fecha_utc" type="string">
+  ISO 8601 timestamp of when the decision was persisted to the database (UTC).
+</ResponseField>
+
+## Error responses
+
+| Status | Meaning |
+|--------|---------|
+| `422 Unprocessable Entity` | One or more request fields failed validation. Common causes: `moneda` not `CLP`/`USD`, `canal` not in the allowed set, `mcc` not a 4-digit string, `pais_transaccion` not exactly 2 characters, or a full PAN detected in `tarjeta_enmascarada`. |
+
+## Example
+
+<CodeGroup>
+
+```bash cURL
+curl -s -X POST http://localhost:8080/api/dominio/evaluar \
+  -H "Content-Type: application/json" \
+  -d '{
+    "usuario_id": "USR-00042",
+    "comercio_id": "COM-0081",
+    "dispositivo_id": "DEV-A1B2C3",
+    "monto": 34900,
+    "moneda": "CLP",
+    "canal": "app",
+    "mcc": "5411",
+    "pais_transaccion": "CL",
+    "ip": "190.45.12.88",
+    "tarjeta_enmascarada": "****7731",
+    "intentos_previos_1h": 0
+  }'
+```
+
+```json Response
+{
+  "prediccion_id": 1047,
+  "transaccion_id": "TXN-3FA2C8D91B04",
+  "decision": "aprobar",
+  "origen": "modelo",
+  "probabilidad_fraude": 0.034,
+  "razones": [
+    {
+      "tipo": "modelo",
+      "factor": "monto_relativo",
+      "descripcion": "Monto dentro del rango habitual del usuario",
+      "aporte_logodds": -1.42,
+      "efecto": "reduce_riesgo"
+    },
+    {
+      "tipo": "modelo",
+      "factor": "canal_conocido",
+      "descripcion": "Canal app es consistente con el historial del dispositivo",
+      "aporte_logodds": -0.87,
+      "efecto": "reduce_riesgo"
+    }
+  ],
+  "version_modelo": "nam-v2.1.0",
+  "version_umbrales": "umbrales-2024-10",
+  "usuario_conocido": true,
+  "latencia_ms": 118.45,
+  "desglose_ms": {
+    "base_de_datos": 12.30,
+    "ia": 104.20
+  },
+  "fecha_utc": "2024-11-15T14:30:01.882Z"
+}
+```
+
+</CodeGroup>
+
+<Warning>
+  **PAN rejection (RNF5 / PCI-DSS):** If `tarjeta_enmascarada` contains a sequence of 13–19 consecutive digits (after stripping spaces and hyphens), the request is immediately rejected with HTTP 422 and the error message `"Se recibió un número de tarjeta completo (PAN). Solo se acepta el enmascarado ****NNNN"`. Full card numbers must never be sent to this API.
+</Warning>
+
+<Note>
+  **Fallback policy (`origen: "reserva"`):** When the IA microservice does not respond within the configured timeout (default 500 ms) or returns an HTTP error, the service applies the fallback rules engine (ADR-3). In this case `probabilidad_fraude` is `null` and `version_modelo`/`version_umbrales` are both `null`. The default rule set blocks transactions on compliance blocklist hits, flags transactions above USD 150, with 3+ prior attempts in the last hour, or from outside Chile — and approves everything else. The active policy is controlled by the `POLITICA_RESERVA` environment variable (`reglas` | `aprobar` | `bloquear`).
+</Note>

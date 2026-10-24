@@ -1,0 +1,86 @@
+---
+title: "GET /resumen — System Summary and Decision Breakdown"
+sidebarTitle: "GET /resumen"
+description: "GET /api/dominio/resumen returns database table counts and a breakdown of all decisions by decision outcome and origin — useful for monitoring and reporting."
+---
+
+The `/resumen` endpoint provides a system-level snapshot of Guardián Centinela's operational state. It returns row counts for each major database table — letting you quickly verify data loads and confirm that historical transaction data is in place — and a full cross-tabulation of every fraud decision recorded since startup, broken down by outcome (`aprobar`/`revisar`/`bloquear`) and by the system that produced it (`modelo`, `regla_dura`, or `reserva`). This makes `/resumen` the primary endpoint for dashboards, health monitoring scripts, and post-deployment sanity checks.
+
+**Base URL (via gateway):** `GET http://localhost:8080/api/dominio/resumen`
+
+This endpoint takes no query parameters.
+
+## Response — 200 OK
+
+<ResponseField name="tablas" type="object">
+  Row counts for the five core database tables, captured in a single multi-scalar query.
+
+  <Expandable title="tablas fields">
+    <ResponseField name="usuarios" type="integer">
+      Total number of user profiles loaded into the `usuarios` table.
+    </ResponseField>
+    <ResponseField name="dispositivos" type="integer">
+      Total number of device profiles in the `dispositivos` table.
+    </ResponseField>
+    <ResponseField name="lista_negra_activa" type="integer">
+      Number of currently **active** entries in the `lista_negra` table (i.e. rows where `activa = true` and `fecha_alta <= current_date`). Inactive or future-dated entries are not counted.
+    </ResponseField>
+    <ResponseField name="transacciones" type="integer">
+      Total historical transaction records loaded into the `transacciones` table (used for user and device profiling).
+    </ResponseField>
+    <ResponseField name="predicciones" type="integer">
+      Total fraud decisions recorded in `predicciones` since the service started (cumulative across all restarts, as the table is not cleared on startup).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="decisiones" type="array">
+  A breakdown of all decisions in the `predicciones` table, grouped by `(decision, origen)` and sorted alphabetically. Each element represents one combination of outcome and originating system.
+
+  <Expandable title="Decision breakdown object fields">
+    <ResponseField name="decision" type="string">
+      The fraud decision outcome: `"aprobar"`, `"bloquear"`, or `"revisar"`.
+    </ResponseField>
+    <ResponseField name="origen" type="string">
+      The system that produced the decision: `"modelo"`, `"regla_dura"`, or `"reserva"`.
+    </ResponseField>
+    <ResponseField name="n" type="integer">
+      The count of decisions with this exact `(decision, origen)` combination.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Example
+
+<CodeGroup>
+
+```bash cURL
+curl -s "http://localhost:8080/api/dominio/resumen"
+```
+
+```json Response
+{
+  "tablas": {
+    "usuarios": 15000,
+    "dispositivos": 22480,
+    "lista_negra_activa": 312,
+    "transacciones": 500000,
+    "predicciones": 1049
+  },
+  "decisiones": [
+    { "decision": "aprobar",  "origen": "modelo",      "n": 831 },
+    { "decision": "aprobar",  "origen": "reserva",     "n": 14  },
+    { "decision": "bloquear", "origen": "modelo",      "n": 63  },
+    { "decision": "bloquear", "origen": "regla_dura",  "n": 28  },
+    { "decision": "bloquear", "origen": "reserva",     "n": 5   },
+    { "decision": "revisar",  "origen": "modelo",      "n": 99  },
+    { "decision": "revisar",  "origen": "reserva",     "n": 9   }
+  ]
+}
+```
+
+</CodeGroup>
+
+<Note>
+  **Monitoring IA availability:** The `decisiones` array is a quick health indicator for the IA microservice. A healthy system should show the vast majority of decisions with `origen: "modelo"`. A spike in rows where `origen: "reserva"` — especially for decisions that would normally be scored by the model — indicates that the IA service is timing out or returning errors. If you see `"reserva"` counts growing rapidly, check the IA service logs and the `IA_TIMEOUT_MS` environment variable configuration.
+</Note>

@@ -1,0 +1,165 @@
+---
+title: "Configure Guardián Centinela Environment Variables"
+sidebarTitle: "Configuration"
+description: "All environment variables for Guardián Centinela: database credentials, IA timeout, reservation policy, connection pool size, and ONNX thread settings."
+---
+
+Guardián Centinela is configured entirely through environment variables. The `compose.yaml` file reads from a `.env` file located in the project root — copy `.env.example` to `.env` before running `docker compose up`. No service requires you to rebuild an image to change these values; a `docker compose -p equipoNN up -d` restart is sufficient.
+
+The table and descriptions below cover every variable declared across `compose.yaml`, `servicio-dominio/main.py`, `servicio-ia/main.py`, and `servicio-carga/carga.py`.
+
+## `.env` file
+
+The shipped example contains the three variables most commonly adjusted in local development:
+
+```ini .env.example
+POSTGRES_PASSWORD=kipu_local
+IA_TIMEOUT_MS=500
+POLITICA_RESERVA=reglas
+```
+
+All other variables listed below have defaults baked into `compose.yaml` or the service code; you only need to add them to `.env` when you want to override them.
+
+<Warning>
+Never commit a real value for `POSTGRES_PASSWORD` to version control, and never use the default `kipu_local` credential in a production or staging environment. Inject the secret at deploy time via your CI/CD secrets store (GitHub Actions secrets, Docker Swarm secrets, Kubernetes `Secret`, etc.). The default exists only for a frictionless local first-run.
+</Warning>
+
+## Variable reference
+
+### Database — `db` and shared services
+
+#### `POSTGRES_PASSWORD`
+
+| | |
+|---|---|
+| **Default** | `kipu_local` |
+| **Used by** | `db`, `dominio`, `carga` |
+
+Password for the `kipu` PostgreSQL user and database. The `db` service uses it directly as `POSTGRES_PASSWORD`; the `dominio` and `carga` services consume it as part of `DATABASE_URL`.
+
+---
+
+#### `DATABASE_URL`
+
+| | |
+|---|---|
+| **Default** | `postgresql://kipu:kipu_local@db:5432/kipu` |
+| **Used by** | `dominio`, `carga` |
+
+Full PostgreSQL DSN passed to psycopg3. Inside the compose network the hostname is always `db` — do not change the host segment unless you are running the services outside Docker. The password segment is derived from `POSTGRES_PASSWORD`, so updating that variable is enough:
+
+```yaml
+# compose.yaml (excerpt — do not edit directly)
+DATABASE_URL: postgresql://kipu:${POSTGRES_PASSWORD:-kipu_local}@db:5432/kipu
+```
+
+---
+
+### Domain service — `servicio-dominio`
+
+#### `IA_URL`
+
+| | |
+|---|---|
+| **Default** | `http://gateway:8080/api/ia` |
+| **Used by** | `dominio` |
+
+The URL the domain service uses to call the IA inference endpoint (`POST /predict`). Traffic is deliberately routed through the gateway — not directly to `ia` — so the gateway's Nginx round-robin load balancer distributes requests across the two `ia` replicas and automatically retries a failed replica.
+
+---
+
+#### `IA_TIMEOUT_MS`
+
+| | |
+|---|---|
+| **Default** | `500` |
+| **Valid range** | Any positive integer (milliseconds) |
+| **Used by** | `dominio` |
+
+Maximum time in milliseconds the domain service waits for the IA service to respond. If the IA does not reply within this window, the domain service falls back to the reservation policy defined by `POLITICA_RESERVA`. The response field `origen` will be `"reserva"` instead of `"modelo"` in that case.
+
+Reducing this value increases resilience to a slow IA but increases the fallback rate. The default of 500 ms covers the p99 IA latency measured in chapter 7.2 of the design document.
+
+---
+
+#### `POLITICA_RESERVA`
+
+| | |
+|---|---|
+| **Default** | `reglas` |
+| **Valid values** | `reglas` \| `aprobar` \| `bloquear` |
+| **Used by** | `dominio` |
+
+Determines how the domain service decides when the IA is unavailable (timeout, HTTP error, or any other failure):
+
+| Value | Behaviour |
+|---|---|
+| `reglas` | Applies the built-in rule engine: blocks if `monto > USD 150`, `intentos_previos_1h ≥ 3`, or `pais_transaccion ≠ CL`; otherwise approves. |
+| `aprobar` | Approves every transaction unconditionally (maximum availability, highest risk). |
+| `bloquear` | Blocks every transaction unconditionally (maximum safety, lowest availability). |
+
+A hard block-list match (`lista_negra_dura = true`) always results in a block regardless of this setting.
+
+<Note>
+The choice of `POLITICA_RESERVA` is a risk-team decision documented in **ADR-3**. Changing it from `reglas` to `aprobar` or `bloquear` has significant business and compliance implications. Coordinate with the Kipu Pagos risk team before modifying this variable in any non-development environment.
+</Note>
+
+---
+
+#### `DB_POOL_MAX`
+
+| | |
+|---|---|
+| **Default** | `8` |
+| **Used by** | `dominio` |
+
+Maximum number of connections in the psycopg3 connection pool maintained by the domain service. The pool is opened at startup and closed on shutdown via the FastAPI lifespan context. Increase this value if you scale `dominio` to multiple replicas or observe pool exhaustion under load; decrease it if PostgreSQL `max_connections` is a constraint.
+
+---
+
+### IA service — `servicio-ia`
+
+#### `ORT_THREADS`
+
+| | |
+|---|---|
+| **Default** | `1` |
+| **Used by** | `ia` |
+
+Number of ONNX Runtime intra-op threads allocated per inference request. The default of `1` is intentional: the container CPU limit is 0.5 cores (see `compose.yaml`), and keeping threads at 1 produces honest, consistent latency measurements. Increasing this value beyond the container's CPU quota will cause thread contention and may _increase_ p99 latency.
+
+---
+
+#### `RUTA_MODELO`
+
+| | |
+|---|---|
+| **Default** | `./model` (relative to the service's working directory inside the container) |
+| **Used by** | `ia` |
+
+Path to the directory containing the four model artefacts: `modelo.onnx`, `preprocesador.joblib`, `metadata.json`, and `umbrales.json`. Override this only if you are mounting a custom model directory into the container.
+
+---
+
+#### `LOG_LEVEL`
+
+| | |
+|---|---|
+| **Default** | `INFO` |
+| **Valid values** | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` \| `CRITICAL` |
+| **Used by** | `ia` |
+
+Python `logging` level for the IA service. Set to `DEBUG` during development to see per-request feature construction details. In production, `INFO` or `WARNING` is recommended to keep log volume manageable.
+
+---
+
+### Loader service — `servicio-carga`
+
+#### `DIR_DATOS`
+
+| | |
+|---|---|
+| **Default** | `./datos` (relative to the working directory inside the container) |
+| **Used by** | `carga` |
+
+Path to the directory containing the pre-treated CSV files (`usuarios.csv`, `dispositivos.csv`, `transacciones.csv`, `lista_negra.csv`) that the loader seeds into PostgreSQL. The loader uses `ON CONFLICT DO NOTHING` so re-running never creates duplicate rows.

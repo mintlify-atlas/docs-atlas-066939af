@@ -1,0 +1,359 @@
+---
+title: "POST /predict — Raw Inference Endpoint for Fraud Scoring"
+sidebarTitle: "POST /predict"
+description: "POST /api/ia/predict accepts a full TransaccionInput payload, runs the ONNX NAM, and returns a calibrated fraud probability, decision, and per-factor explainability reasons."
+---
+
+The `/predict` endpoint is the direct interface to the Neural Additive Model (NAM) inference engine. It accepts a `TransaccionInput` payload assembled by the domain service, runs the ONNX model, applies Platt-scaling calibration, and returns a fraud probability, a three-zone decision, and the top three explainability factors.
+
+**This endpoint is intended to be called by the domain microservice** (`servicio-dominio`). Direct use is reserved for integration testing, load testing, and local debugging — the domain service provides database enrichment, hard-rule enforcement, audit trail persistence, and fallback policy that this endpoint does not.
+
+<Warning>
+  In production, always call **POST /api/dominio/evaluar** instead of calling this endpoint directly. The domain service enriches the payload from the database (user profile, device profile, blocklist status), enforces compliance hard rules, writes the audit trail, and applies the fallback policy when the inference service is unavailable. Calling `/predict` directly bypasses all of those safeguards.
+</Warning>
+
+## Endpoint
+
+| Property     | Value                                   |
+|--------------|-----------------------------------------|
+| **Method**   | `POST`                                  |
+| **Base URL** | `http://localhost:8080/api/ia/predict`  |
+| **Content-Type** | `application/json`                  |
+| **Auth**     | Internal network only (no public token) |
+
+---
+
+## Request Body
+
+The request body must be a JSON object conforming to `TransaccionInput`.
+
+### Core Transaction Fields
+
+<ParamField body="transaccion_id" type="string" required>
+  Unique identifier for the transaction. Echoed back verbatim in the response. Used for correlation in logs and the audit trail.
+</ParamField>
+
+<ParamField body="usuario_id" type="string" required>
+  Identifier of the user initiating the transaction. Used to join the user profile object.
+</ParamField>
+
+<ParamField body="comercio_id" type="string" required>
+  Identifier of the merchant receiving the transaction.
+</ParamField>
+
+<ParamField body="dispositivo_id" type="string">
+  Identifier of the device used for the transaction. Optional; if absent, all device-derived features are treated as missing and median-imputed by the preprocessor.
+</ParamField>
+
+<ParamField body="timestamp" type="string" required>
+  Transaction timestamp. Three formats are accepted:
+
+  - **ISO 8601 with time zone** — `2024-11-20T14:32:05-04:00` or `2024-11-20T18:32:05Z` *(preferred)*
+  - **Space-separated datetime** — `2024-11-20 14:32:05` (no zone)
+  - **Chilean short form** — `20/11/2024 14:32` (no zone)
+
+  Timestamps without a time zone offset are interpreted as **Chile local time (UTC−4)**. An unrecognisable format returns `422 EntradaInvalida`.
+</ParamField>
+
+<ParamField body="monto" type="number | string" required>
+  Transaction amount. Two forms are accepted:
+
+  - **JSON number** — `1200.00` or `45.5`; the dot is always the decimal separator.
+  - **Text string** — Chilean peso style `"$1.200"` is parsed as `1200` CLP; comma-decimal style `"45,50"` is parsed as `45.50`.
+
+  An unrecognisable value returns `422 EntradaInvalida`.
+</ParamField>
+
+<ParamField body="moneda" type="string">
+  Currency code: `"CLP"` or `"USD"`. If omitted, the currency is inferred from the amount magnitude using the same heuristic applied during training. Only `CLP` and `USD` are supported; anything else returns `422 EntradaInvalida`.
+</ParamField>
+
+<ParamField body="canal" type="string" required>
+  Transaction channel. Accepted values: `"app"`, `"web"`, `"pos"`, `"api"`. An unknown value raises `422 EntradaInvalida` because the category was not seen during training.
+</ParamField>
+
+<ParamField body="pais_transaccion" type="string" required>
+  Two-letter ISO 3166-1 alpha-2 country code of the transaction origin (e.g. `"CL"`, `"US"`, `"BR"`). Must match a category seen during training; an unknown code returns `422 EntradaInvalida`.
+</ParamField>
+
+<ParamField body="mcc" type="number | string" required>
+  Merchant Category Code (ISO 18245). Accepts a numeric value (`5411`) or a numeric string (`"5411"`). Parsed internally via `int(float(str(mcc)))`. A non-numeric value returns `422 EntradaInvalida`.
+</ParamField>
+
+<ParamField body="ip" type="string">
+  Client IP address as a string. Optional; used only for feature engineering when present.
+</ParamField>
+
+<ParamField body="intentos_previos_1h" type="number">
+  Number of transaction attempts by this user in the preceding hour. Must be ≥ 0. If unknown, omit the field entirely — the preprocessor treats the missing value via median imputation, matching the training-time handling of missing data.
+</ParamField>
+
+<ParamField body="tarjeta_enmascarada" type="string">
+  Masked PAN (e.g. `"****1234"`). Optional; used for velocity and device-binding features.
+</ParamField>
+
+### Enrichment Objects
+
+<ParamField body="usuario" type="object">
+  User profile assembled by the domain service from the database. All sub-fields are optional; any field left `null` is median-imputed by the preprocessor.
+
+  <Expandable title="PerfilUsuario fields">
+    <ParamField body="pais_usuario" type="string">
+      Two-letter ISO country code of the user's registered country (e.g. `"CL"`).
+    </ParamField>
+
+    <ParamField body="segmento" type="string">
+      User segment. Accepted values: `"persona"`, `"comercio_pequeno"`, `"comercio_grande"`.
+    </ParamField>
+
+    <ParamField body="verificado" type="float">
+      Identity verification score, `0.0`–`1.0`.
+    </ParamField>
+
+    <ParamField body="telefono_verificado" type="float">
+      Phone verification score, `0.0`–`1.0`.
+    </ParamField>
+
+    <ParamField body="nivel_kyc" type="float">
+      KYC completion level, `0.0`–`3.0`.
+    </ParamField>
+
+    <ParamField body="dominio_desechable" type="float">
+      Probability that the user's email domain is a disposable/temporary address, `0.0`–`1.0`.
+    </ParamField>
+
+    <ParamField body="fecha_registro" type="string">
+      Account registration date in `YYYY-MM-DD` format. Used to derive account age features.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ParamField body="dispositivo" type="object">
+  Device profile assembled by the domain service. All sub-fields are optional.
+
+  <Expandable title="PerfilDispositivo fields">
+    <ParamField body="tipo_dispositivo" type="string">
+      Device type. Accepted values: `"android"`, `"ios"`, `"web"`, `"pos"`.
+    </ParamField>
+
+    <ParamField body="pais_disp" type="string">
+      Two-letter ISO country code of the device's registered or last-seen country.
+    </ParamField>
+
+    <ParamField body="emulador" type="float">
+      Emulator detection score, `0.0`–`1.0`. Higher values indicate higher probability the device is a software emulator.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+### Blocklist Flags
+
+<ParamField body="lista_negra_interna" type="boolean" default="false">
+  Set to `true` if the transaction's identifiers (user, device, card, IP) matched an **active, non-hard** entry in the internal blocklist. The model treats this as a soft risk signal; it can still result in `"aprobar"` or `"revisar"` depending on the overall probability.
+</ParamField>
+
+<ParamField body="lista_negra_dura" type="boolean" default="false">
+  Set to `true` if the transaction matched an **active hard (compliance-mandated)** blocklist entry. Hard blocklist hits unconditionally force the decision to `"bloquear"` regardless of the model's probability output. The `regla_aplicada` field in the response will be populated.
+</ParamField>
+
+---
+
+## Response Body
+
+A successful `200 OK` returns a `PrediccionResponse` JSON object.
+
+<ResponseField name="transaccion_id" type="string">
+  Echo of the `transaccion_id` from the request. Use this for correlation.
+</ResponseField>
+
+<ResponseField name="decision" type="string">
+  Three-zone fraud decision:
+
+  | Value       | Meaning                                                                   |
+  |-------------|---------------------------------------------------------------------------|
+  | `"aprobar"` | Probability below the approval threshold; transaction is low-risk.        |
+  | `"revisar"` | Probability in the review band; manual review recommended. Only possible during business hours (the "turno" window). |
+  | `"bloquear"` | Probability above the block threshold, or a hard blocklist rule fired.   |
+</ResponseField>
+
+<ResponseField name="probabilidad_fraude" type="float">
+  Calibrated production probability of fraud, rounded to 5 decimal places (e.g. `0.03142`). This is the output of the ONNX NAM after Platt-scaling calibration with prior-ratio correction — it is a true posterior probability, not a raw model score.
+</ResponseField>
+
+<ResponseField name="razones" type="array">
+  Top three contributing factors, ranked by absolute log-odds contribution `|aporte_logodds|`. Each element is a `RazonExplicabilidad` object.
+
+  <Expandable title="RazonExplicabilidad fields">
+    <ResponseField name="factor" type="string">
+      Internal feature name (e.g. `"hora_local"`, `"monto_valor"`, `"nivel_kyc"`).
+    </ResponseField>
+
+    <ResponseField name="descripcion" type="string">
+      Human-readable description of the factor.
+    </ResponseField>
+
+    <ResponseField name="valor" type="any">
+      The actual value of the feature for this transaction. May be a number, string, or `null` if the feature was imputed.
+    </ResponseField>
+
+    <ResponseField name="aporte_logodds" type="float">
+      The factor's contribution in log-odds space after calibration scaling. Positive values push toward fraud; negative values push toward legitimate. The three reasons are ordered by `|aporte_logodds|` descending.
+    </ResponseField>
+
+    <ResponseField name="efecto" type="string">
+      Plain-language direction: `"sube el riesgo"` (increases risk) or `"baja el riesgo"` (decreases risk).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="version_modelo" type="string">
+  Semver identifier of the ONNX model artifact that produced this prediction (e.g. `"2.1.0"`).
+</ResponseField>
+
+<ResponseField name="version_umbrales" type="string">
+  Version of the threshold configuration (`umbrales.json`) used for the three-zone decision.
+</ResponseField>
+
+<ResponseField name="latencia_ms" type="float">
+  End-to-end inference latency in milliseconds, measured from the start of `construir_features` to completion of serialization (e.g. `4.73`).
+</ResponseField>
+
+<ResponseField name="regla_aplicada" type="string | null">
+  Name of the hard rule that forced the decision, if any (e.g. `"lista_negra"`). `null` when the decision came from the model's probability score rather than a hard rule.
+</ResponseField>
+
+---
+
+## Error Responses
+
+| HTTP Status | Condition |
+|-------------|-----------|
+| `422 Unprocessable Entity` | `EntradaInvalida` — the payload could not be parsed. Causes: unrecognised timestamp format, unparseable `monto`, unknown `canal` or `pais_transaccion` category, non-numeric `mcc`. The `detail` field contains a human-readable description. |
+| `500 Internal Server Error` | Unexpected failure during feature construction or ONNX inference. Check service logs (`servicio-ia`) for the full traceback. |
+| `503 Service Unavailable` | Model artefacts not yet loaded — the service is still starting up or `cargar_artefactos()` failed. The `/health` endpoint will also return `503` in this state. |
+
+---
+
+## Timestamp Format Details
+
+The preferred format is **ISO 8601 with an explicit time zone offset**:
+
+```
+2024-11-20T14:32:05-04:00   ← Chile Standard Time
+2024-11-20T18:32:05Z        ← UTC equivalent
+```
+
+When no time zone is provided, the service assumes **Chile local time (UTC−4)**. The following zone-naive formats are also accepted:
+
+```
+2024-11-20 14:32:05         ← space-separated, no zone → treated as Chile time
+20/11/2024 14:32            ← dd/mm/YYYY HH:MM → treated as Chile time
+```
+
+Any other format causes a `422` with detail `"timestamp: formato no reconocido"`.
+
+---
+
+## Amount Format Details
+
+| Input form | Parsed value | Notes |
+|---|---|---|
+| `1200` (JSON number) | `1200.00` | Dot is always decimal |
+| `45.5` (JSON number) | `45.50` | |
+| `"$1.200"` (string) | `1200.00` | CLP style: dot is thousands separator |
+| `"1.200,00"` (string) | `1200.00` | CLP full form |
+| `"45,50"` (string) | `45.50` | USD/European style: comma is decimal |
+| `"45.50"` (string) | `45.50` | Plain decimal string |
+
+Internally, JSON numbers are converted to comma-decimal strings before passing to `preparar.parse_monto`, ensuring the dot-vs-comma ambiguity is resolved deterministically.
+
+---
+
+## Examples
+
+<CodeGroup>
+
+```bash cURL
+curl -X POST http://localhost:8080/api/ia/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transaccion_id": "txn-2024-abc123",
+    "usuario_id": "usr-88201",
+    "comercio_id": "com-5543",
+    "dispositivo_id": "dev-99012",
+    "timestamp": "2024-11-20T14:32:05-04:00",
+    "monto": 154990.00,
+    "moneda": "CLP",
+    "canal": "app",
+    "pais_transaccion": "CL",
+    "mcc": 5411,
+    "ip": "190.20.14.33",
+    "intentos_previos_1h": 1,
+    "tarjeta_enmascarada": "****7821",
+    "usuario": {
+      "pais_usuario": "CL",
+      "segmento": "persona",
+      "verificado": 1.0,
+      "telefono_verificado": 1.0,
+      "nivel_kyc": 2.0,
+      "dominio_desechable": 0.0,
+      "fecha_registro": "2021-03-15"
+    },
+    "dispositivo": {
+      "tipo_dispositivo": "android",
+      "pais_disp": "CL",
+      "emulador": 0.0
+    },
+    "lista_negra_interna": false,
+    "lista_negra_dura": false
+  }'
+```
+
+```json Response (200 OK)
+{
+  "transaccion_id": "txn-2024-abc123",
+  "decision": "aprobar",
+  "probabilidad_fraude": 0.01847,
+  "razones": [
+    {
+      "factor": "nivel_kyc",
+      "descripcion": "Aporte del factor nivel_kyc",
+      "valor": 2.0,
+      "aporte_logodds": -0.412,
+      "efecto": "baja el riesgo"
+    },
+    {
+      "factor": "hora_local",
+      "descripcion": "Aporte del factor hora_local",
+      "valor": 14.535,
+      "aporte_logodds": -0.287,
+      "efecto": "baja el riesgo"
+    },
+    {
+      "factor": "monto_valor",
+      "descripcion": "Aporte del factor monto_valor",
+      "valor": 154990.0,
+      "aporte_logodds": 0.193,
+      "efecto": "sube el riesgo"
+    }
+  ],
+  "version_modelo": "2.1.0",
+  "version_umbrales": "1.0.0",
+  "latencia_ms": 4.73,
+  "regla_aplicada": null
+}
+```
+
+```json Response (422 — bad timestamp)
+{
+  "detail": "timestamp: formato no reconocido (ISO8601 con zona, 'YYYY-MM-DD HH:MM:SS' o 'dd/mm/YYYY HH:MM')"
+}
+```
+
+```json Response (503 — model not loaded)
+{
+  "detail": "Servicio de modelo no inicializado"
+}
+```
+
+</CodeGroup>

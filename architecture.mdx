@@ -1,0 +1,176 @@
+---
+title: "Guardián Centinela System Architecture and Service Design"
+sidebarTitle: "Architecture"
+description: "Five-service Docker Compose architecture: nginx gateway, domain API, two inference replicas, data loader, and PostgreSQL — with health checks, rate limiting, and round-robin load balancing."
+---
+
+Guardián Centinela runs as a Docker Compose application named `kipu-guardian-centinela`. All services communicate over a single internal bridge network called `interna`. The nginx gateway is the **only** service that publishes a port to the host — everything else is unreachable from outside the Docker network by design. This means the entire system presents a single attack surface at port 8080.
+
+<Note>
+  The single-port design is not a convenience choice — it is a security boundary. Only `gateway` has a `ports` entry (`8080:8080`). Every other service, including the domain API and both inference replicas, is accessible only via the gateway's controlled proxy routes. Direct container-to-container calls that bypass the gateway are not possible from outside the `interna` network.
+</Note>
+
+## Services at a Glance
+
+The stack consists of six containers (five logical services, with the inference service scaled to two replicas):
+
+<CardGroup cols={2}>
+  <Card title="gateway" icon="shield-halved">
+    **nginx** reverse proxy and API gateway. Terminates all external HTTP traffic on port 8080, applies rate limiting, routes requests to the correct upstream, and handles downstream failures with structured JSON error responses.
+  </Card>
+  <Card title="front" icon="display">
+    **Static front-end** web application. Served by nginx on the internal network. Provides the analyst dashboard and the manual transaction evaluation UI. Registered as a health-checked upstream in the gateway.
+  </Card>
+  <Card title="dominio" icon="building-columns">
+    **FastAPI domain API** — the sole reader and writer of the PostgreSQL database. Validates incoming transactions (including PAN rejection), enriches them with user and device profiles, applies blacklist checks, calls the inference service, runs the fallback policy if inference is unavailable, and writes the immutable audit record.
+  </Card>
+  <Card title="ia (×2 replicas)" icon="microchip">
+    **FastAPI + ONNX inference service**. Runs the pre-trained Neural Additive Model via ONNX Runtime, applies Platt calibration to shift probabilities to production priors, applies threshold rules, and returns the fraud probability, decision, and per-factor contribution scores.
+  </Card>
+  <Card title="carga" icon="upload">
+    **One-shot data loader**. Runs once at startup, seeds the database with reference data (users, devices, merchants, blacklists, historical transactions), then exits. `ON CONFLICT DO NOTHING` makes reruns safe. The `dominio` service waits for `carga` to complete before accepting requests.
+  </Card>
+  <Card title="db" icon="database">
+    **PostgreSQL 16** (Alpine). The only stateful service. Backed by a named Docker volume (`datos-pg`) — no bind mounts. All schema ownership and data access belongs exclusively to `dominio`.
+  </Card>
+</CardGroup>
+
+## Network Topology
+
+```
+Host (port 8080)
+      │
+      ▼
+┌─────────────┐       interna (bridge)
+│   gateway   │──────────────────────────────────────────────────────┐
+│  (nginx)    │                                                       │
+└──────┬──────┘                                                       │
+       │ /                      ┌─────────┐                          │
+       ├───────────────────────▶│  front  │                          │
+       │                        └─────────┘                          │
+       │ /api/dominio/           ┌──────────┐     ┌────┐             │
+       ├───────────────────────▶ │ dominio  │────▶│ db │             │
+       │                         └────┬─────┘     └────┘             │
+       │ /api/ia/                     │ POST /predict                 │
+       │                         ┌────▼─────┐  ┌──────────┐         │
+       └───────────────────────▶ │  ia [0]  │  │  ia [1]  │         │
+                (round-robin)    └──────────┘  └──────────┘         │
+                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+   (carga and db also on interna; carga exits after seeding)
+```
+
+No service outside `gateway` binds to a host port. The `dominio` service reaches the inference service via `http://gateway:8080/api/ia` — routing its own outbound call back through the gateway — so it automatically benefits from round-robin load balancing and the gateway's retry-on-failure logic without needing any client-side load balancing code.
+
+## Request Flow
+
+<Steps>
+  <Step title="Client → Gateway">
+    An HTTP request arrives at `gateway:8080`. nginx applies the global rate limit (`400r/s`, burst 200) and routes by path prefix. The `X-Request-Id` header is injected and forwarded downstream.
+  </Step>
+  <Step title="Gateway → dominio">
+    Requests to `/api/dominio/` are proxied to the `dominio_up` upstream (`dominio:8000`). The gateway enforces a 1 s connect timeout and a 5 s read timeout.
+  </Step>
+  <Step title="dominio: validation + DB lookup">
+    The domain service validates the payload (rejects full PANs, enforces field constraints), then queries PostgreSQL for the user profile, device profile, and any active blacklist matches.
+  </Step>
+  <Step title="dominio → ia (via gateway)">
+    The domain service POSTs to `http://gateway:8080/api/ia/predict` with a 500 ms timeout (`IA_TIMEOUT_MS`). The gateway round-robins the call across the two `ia` replicas and retries on the other replica if the first returns an error, timeout, 502, or 503.
+  </Step>
+  <Step title="ia: inference">
+    The inference service preprocesses the payload, runs the ONNX graph, applies calibration, evaluates thresholds, and returns the fraud probability, decision, and per-factor `razones` array.
+  </Step>
+  <Step title="dominio: decision + audit write">
+    The domain service merges blacklist reasons with the model's reasons, determines the final `origen` (`modelo`, `regla_dura`, or `reserva`), inserts the full audit row into `predicciones`, and returns the response.
+  </Step>
+  <Step title="Gateway → Client">
+    The response travels back through the gateway. The `X-Upstream` response header identifies which `ia` replica handled the inference call — useful for debugging and load verification.
+  </Step>
+</Steps>
+
+## Resource Limits
+
+Each service declares explicit CPU and memory limits set from `docker stats` measurements (section 7.2 of the project spec):
+
+| Service | `cpus` | `mem_limit` | Notes |
+|---|---|---|---|
+| `gateway` | 0.50 | 64 MB | nginx; mostly idle between requests |
+| `front` | 0.25 | 32 MB | static file serving |
+| `dominio` | 1.00 | 256 MB | Python + psycopg connection pool |
+| `ia` (each replica) | 0.50 | 512 MB | ONNX Runtime + model weights in memory |
+| `carga` | 0.50 | 128 MB | one-shot; exits after seeding |
+| `db` | 1.00 | 256 MB | PostgreSQL 16-alpine |
+
+<Tip>
+  The two `ia` replicas each hold their ONNX model in memory independently. Total inference memory footprint is up to 1 GB (2 × 512 MB). If host memory is constrained, scale `ia` back to one replica — the gateway will route all inference traffic to the single instance without any configuration change.
+</Tip>
+
+## Gateway nginx Configuration
+
+The gateway implements three routing rules and one global rate limit zone, all in `servicio-gateway/nginx.conf`:
+
+**Rate limiting** — A single zone called `api` is defined at `400r/s` with a burst of 200 requests (nodelay). This is approximately four times the estimated peak throughput of ~92 req/s (5,500/min), providing headroom for traffic spikes while capping abuse. Requests that exceed the burst are answered with a structured JSON `429` response — never an nginx HTML error page.
+
+**Front-end** (`/`) — Proxied to `front_up` (the `front` service on port 80). No additional restrictions.
+
+**Domain API** (`/api/dominio/`) — Proxied to `dominio_up` (`dominio:8000`), rate limited. Connect timeout 1 s, read timeout 5 s. Keepalive pool of 16 connections to the domain service.
+
+**Inference API** (`/api/ia/`) — Proxied to `ia_up` with stricter settings:
+
+```nginx
+upstream ia_up {
+    zone ia 64k;
+    server ia:8000 resolve max_fails=1 fail_timeout=10s;
+    keepalive 16;
+}
+
+location /api/ia/ {
+    limit_except GET POST { deny all; }
+    limit_req zone=api burst=200 nodelay;
+    proxy_pass http://ia_up/;
+    proxy_connect_timeout 300ms;
+    proxy_read_timeout 2s;
+    proxy_next_upstream error timeout http_502 http_503 non_idempotent;
+    proxy_next_upstream_tries 2;
+}
+```
+
+The `resolve` directive combined with Docker's internal DNS (`127.0.0.11`, re-resolved every 5 s) means nginx discovers both `ia` replica IPs dynamically. Round-robin distribution requires no static IP configuration. If a replica fails a request, `proxy_next_upstream` retries the call on the other replica — exactly once (`proxy_next_upstream_tries 2`). Only GET and POST are accepted at this location; all other methods are denied.
+
+**Error responses** — If an upstream is completely down, nginx returns a structured JSON payload from a named `@caido` location rather than its default HTML error pages:
+
+```nginx
+error_page 502 503 504 = @caido;
+location @caido {
+    default_type application/json;
+    return 503 '{"error":"servicio_no_disponible","detalle":"el gateway no obtuvo respuesta del servicio","request_id":"$request_id"}';
+}
+```
+
+## Fallback / Reservation Policy
+
+When the inference service is unreachable — due to a timeout (default: 500 ms), HTTP error, or malformed response — the domain service applies the reservation policy rather than failing the request. The policy is configured via the `POLITICA_RESERVA` environment variable, whose value is a **risk team decision** (ADR-3, not an engineering default):
+
+| `POLITICA_RESERVA` value | Behavior |
+|---|---|
+| `reglas` *(default)* | Rule-based triage: blocks if a hard blacklist hit exists; otherwise reviews if amount > USD 150, ≥ 3 prior attempts in the last hour, or country ≠ CL; otherwise approves. |
+| `aprobar` | Approves all transactions unconditionally when inference is down. |
+| `bloquear` | Blocks all transactions unconditionally when inference is down. |
+
+<Warning>
+  The `POLITICA_RESERVA` setting is **not a technical default** — it encodes the risk team's accepted exposure during an inference outage (ADR-3). Changing it from `reglas` to `aprobar` or `bloquear` has direct financial and compliance implications and must be authorized by risk management before deployment.
+</Warning>
+
+Regardless of the chosen policy mode, a hard blacklist match (`dura = true`) always triggers a block — the hard rule overrides the reservation policy just as it overrides the model.
+
+## Decision Origin Field
+
+Every audit record in `predicciones` includes an `origen` field that identifies how the decision was reached:
+
+| `origen` value | Meaning |
+|---|---|
+| `modelo` | The fraud probability from the NAM determined the decision and no hard blacklist rule overrode it. |
+| `regla_dura` | A compliance blacklist entry marked `dura = true` forced a `bloquear` decision, overriding the model score. |
+| `reserva` | The inference service was unavailable; the reservation policy (`POLITICA_RESERVA`) produced the decision. |
+
+This three-way distinction lets compliance teams, model monitors, and incident responders immediately understand the source of any given decision without inspecting the full reasons array.

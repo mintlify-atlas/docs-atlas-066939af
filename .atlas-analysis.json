@@ -1,0 +1,74 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "Guardián Centinela",
+  "projectDescription": "A containerized, real-time fraud detection system for Kipu Pagos, built as a microservices architecture with an explainable neural additive model (NAM), a domain API, a data pipeline, and an Nginx API gateway.",
+  "theme": "luma",
+  "primaryColor": "#1f6feb",
+  "lightColor": "#e8f0fe",
+  "darkColor": "#0d2a4d",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guide",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": ["introduction", "architecture"]
+          },
+          {
+            "group": "Getting Started",
+            "pages": ["quickstart", "configuration"]
+          },
+          {
+            "group": "Data Pipeline",
+            "pages": ["data/overview", "data/cleaning-rules", "data/feature-engineering", "data/training"]
+          },
+          {
+            "group": "Services",
+            "pages": ["services/gateway", "services/domain", "services/inference", "services/loader"]
+          },
+          {
+            "group": "Operations",
+            "pages": ["operations/deployment", "operations/ci-cd", "operations/monitoring"]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Domain API",
+            "pages": ["api/evaluate", "api/predictions", "api/users", "api/summary"]
+          },
+          {
+            "group": "Inference API",
+            "pages": ["api/predict", "api/schemas"]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Real-time fraud scoring via REST API with sub-500ms latency target",
+    "Explainable Neural Additive Model (NAM) trained with TensorFlow/Keras and exported to ONNX",
+    "Platt calibration with production prior correction for accurate fraud probabilities",
+    "Hard-rule blocklist (compliance-grade) with time-aware blacklist crossing",
+    "Fallback reservation policy when the inference service is unavailable",
+    "Full audit trail: every decision stored with model version, inputs, and reasons",
+    "PCI-DSS compliance: full PAN rejected at the API boundary; only masked card accepted",
+    "Idempotent data loader with PostgreSQL schema and ON CONFLICT DO NOTHING",
+    "GitHub Actions CI/CD pipeline with quality gate (ROC-AUC ≥ 0.96, PR-AUC ≥ 0.45)",
+    "Docker Compose deployment with nginx API gateway, 2 IA replicas, and health checks"
+  ],
+  "publicApiSurface": [
+    "POST /api/dominio/evaluar — evaluate a transaction and return a fraud decision",
+    "GET /api/dominio/predicciones — list recent predictions",
+    "GET /api/dominio/predicciones/{transaccion_id} — replay a specific transaction decision",
+    "GET /api/dominio/usuarios — list sample users for the frontend",
+    "GET /api/dominio/resumen — system summary (table row counts, decision breakdown)",
+    "GET /api/dominio/health — domain service health check",
+    "POST /api/ia/predict — raw inference endpoint (called internally by domain service)",
+    "GET /api/ia/health — inference service health check",
+    "GET /health — gateway health check"
+  ]
+}

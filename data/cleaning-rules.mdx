@@ -1,0 +1,219 @@
+---
+title: "Data Cleaning: 19 Rules for Fraud Model Reliability"
+sidebarTitle: "Cleaning Rules"
+description: "All 19 data cleaning rules applied by preparar.py to transacciones, usuarios, dispositivos, and lista_negra — with rationale and affected row counts per rule."
+---
+
+`preparar.py` applies exactly one rule per problem. Every rule has a written rationale, a decision type (`corregir` to correct, `descartar` to discard, or `marcar` to flag), and a row count recorded in `reporte_tratamiento.json`. No rule is applied silently, and an unknown category value stops the pipeline with exit code 2 rather than passing bad data downstream.
+
+The rules below are presented in the order they appear in the `REGLAS` list in `preparar.py`. Rules R01–R15 cover structural and value problems in the raw CSVs. Rules R16–R17 address the labeling situation specific to fraud data. Rules R18–R19 cover the blocklist and null handling strategy.
+
+## R01–R05: Identity and Format Normalization
+
+<AccordionGroup>
+  <Accordion title="R01 — Duplicate transaccion_id (exact row copy) → discard" icon="copy">
+    **Table:** transacciones  
+    **Decision:** descartar
+
+    When the same `transaccion_id` appears more than once as an identical row copy, the duplicate is dropped before any other processing. Keeping it would inflate training counts and double-count the fraud risk amount. This is applied with `drop_duplicates(subset="transaccion_id")` before normalization runs.
+
+    Row count tracked as `R01` in `cuentas`.
+  </Accordion>
+
+  <Accordion title="R02 — Duplicate primary keys with differing values → keep first, report conflict" icon="id-card">
+    **Tables:** usuarios, dispositivos  
+    **Decision:** descartar (keep first)
+
+    Exact duplicate rows are discarded. When two rows share the same `usuario_id` or `dispositivo_id` but have different field values (a conflicting copy), the first occurrence is kept and the conflict count is recorded separately in the report. This is documented as `R02_usuarios_conflictivos` and `R02_dispositivos_conflictivos`.
+  </Accordion>
+
+  <Accordion title="R03 — Category values written in multiple forms → normalize via equivalence tables" icon="spell-check">
+    **Tables:** all  
+    **Decision:** corregir
+
+    Raw data contains variations such as `CL`, `cl`, `chile`, `Chile ` (trailing space) for the same country; `movil` and `app` for the same channel; `individuo` and `persona` for the same segment; and `si`, `1`, `TRUE` for boolean true. All of these are resolved against explicit equivalence tables (`PAIS`, `CANAL`, `SEGMENTO`, `BOOL`, `RESULTADO`, `TIPO_DISP`, `TIPO_LN`) using a key normalization function that strips accents, lowercases, and collapses whitespace.
+
+    **If a value is not in the equivalence table, the pipeline stops with exit code 2.** Unknown categories are not silently passed through.
+
+    Row count tracks corrections in `canal` and `pais_transaccion` as `R03`.
+  </Accordion>
+
+  <Accordion title="R04 — Timestamps in 4 formats, some with timezone → convert all to UTC" icon="clock">
+    **Tables:** transacciones, dispositivos  
+    **Decision:** corregir
+
+    Timestamps arrive in four formats:
+    - ISO 8601 with timezone suffix (`Z` or `±HH:MM`) — parsed directly to UTC
+    - `dd/mm/yyyy HH:MM` without timezone — treated as Chile local time (UTC−4) and offset by +4 hours
+    - `yyyy-mm-dd HH:MM:SS` without timezone — treated as Chile local time and offset by +4 hours
+
+    The UTC−4 offset is fixed (not DST-aware) and was verified against the data. Dates without a zone marker read as UTC would shift every event by four hours, corrupting `hora_local` and `es_madrugada`.
+
+    Row count (`R04`) is the number of rows that lacked a timezone marker and were shifted.
+  </Accordion>
+
+  <Accordion title="R05 — Calendar dates in 3 formats → parse with known patterns" icon="calendar">
+    **Tables:** usuarios, lista_negra  
+    **Decision:** corregir
+
+    Registration dates and blocklist `fecha_alta` values arrive in three formats: `yyyy-mm-dd`, `dd/mm/yyyy`, and `dd-mm-yyyy`. All are parsed day-first. The parser attempts each pattern in sequence and leaves unrecognized values as `NaT`.
+  </Accordion>
+</AccordionGroup>
+
+## R06–R13: Value Validity and Impossible Values
+
+<AccordionGroup>
+  <Accordion title="R06 — fecha_registro in the future → null the date" icon="calendar-xmark">
+    **Table:** usuarios  
+    **Decision:** marcar
+
+    A registration date in the future is impossible. The date is set to null; the row is kept. The downstream consequence is that `edad_cuenta_dias` (computed as transaction date minus registration date) also becomes null for that user. The null is later imputed by the model preprocessor (R19).
+
+    Row count is `R06`.
+  </Accordion>
+
+  <Accordion title="R07 — Amount with currency symbols, mixed decimal separators, and empty currency → correct and infer" icon="dollar-sign">
+    **Table:** transacciones  
+    **Decision:** corregir
+
+    Raw amounts may include a leading `$`, use a period as a thousands separator (CLP style: `$1.265` = 1265), or use a comma as a decimal separator (USD style: `6,36` = 6.36). The parser distinguishes the two by counting digits after the separator: three digits means thousands (CLP pattern); fewer means decimal (USD pattern).
+
+    When `moneda` is empty, currency is inferred from the amount: values ≥ 900 are CLP, values ≤ 313 are USD. This boundary holds without ambiguity in the current dataset (CLP minimum is 901; USD maximum is 313). The pipeline verifies this assumption at runtime and stops if it no longer holds.
+
+    All amounts are then converted to USD (`monto_usd`) using a fixed rate of 950 CLP/USD (documented in the case study). Row count (`R07`) is the number of rows where currency was inferred.
+  </Accordion>
+
+  <Accordion title="R08 — Negative amount → take absolute value and set flag" icon="minus">
+    **Table:** transacciones  
+    **Decision:** corregir
+
+    Negative amounts are replaced with their absolute value. Whether the original sign was a data entry error or a reversal cannot be determined from the available fields, so the direction is not assumed. The row is flagged with `flag_monto_negativo = 1`.
+
+    Row count is `R08`.
+  </Accordion>
+
+  <Accordion title="R09 — Zero amount → keep and flag" icon="circle-0">
+    **Table:** transacciones  
+    **Decision:** marcar
+
+    A zero-amount transaction may represent a card verification (a common fraud technique to test whether a card is live before using it for a larger transaction). The row is kept and flagged with `flag_monto_cero = 1`. It is not dropped.
+
+    Row count is `R09`.
+  </Accordion>
+
+  <Accordion title="R10 — Coordinates (0, 0) or out of range → null and flag" icon="location-dot-slash">
+    **Table:** transacciones  
+    **Decision:** marcar
+
+    Coordinates at exactly (0, 0) are a sentinel for missing data — (0, 0) is in the Gulf of Guinea, not a valid payment location. Coordinates with `|lat| > 90` or `|lon| > 180` are physically impossible. Both cases are nulled out and flagged with `flag_coord_nula = 1`. The row is kept.
+
+    Row count is `R10`.
+  </Accordion>
+
+  <Accordion title="R11 — Missing or invalid IP → null and flag" icon="wifi-slash">
+    **Table:** transacciones  
+    **Decision:** marcar
+
+    IPs are validated by checking that they have exactly four octets, each a number between 0 and 255. Values like `-`, truncated octets, or empty strings fail validation. Invalid IPs are set to null and flagged with `flag_ip_invalida = 1` (exposed as `ip_ausente_o_invalida` in the feature set). **The absence of a valid IP is itself a fraud signal** and is kept as a model feature.
+
+    Row count is `R11`.
+  </Accordion>
+
+  <Accordion title="R12 — nivel_kyc outside range 0–3 → null" icon="user-slash">
+    **Table:** usuarios  
+    **Decision:** marcar
+
+    KYC level must be an integer in `{0, 1, 2, 3}`. Values outside this range (such as `-1` found in the data) are impossible and are replaced with null. The null is later imputed by the model preprocessor.
+
+    Row count is `R12`.
+  </Accordion>
+
+  <Accordion title="R13 — edad_cuenta_dias column dropped; recalculated from dates" icon="calculator">
+    **Table:** usuarios  
+    **Decision:** descartar (column)
+
+    The `edad_cuenta_dias` column in `usuarios.csv` is a snapshot taken at the data cut-off date. It represents the age of the account at the time the file was exported — not at the time of each individual transaction. Using it directly would introduce future information into training (for transactions near the cut-off, the snapshot value and the true per-transaction value converge; for older transactions they diverge in a way that is not available at inference time).
+
+    The column is dropped. Account age is recalculated for each row as `(ts_utc − fecha_registro)` in days. Negative results (which occur when `fecha_registro` is after the transaction timestamp, itself an impossible value corrected by R06) are set to null.
+
+    Row count (`R13`) is the number of pre-existing negative values in the original column; `R13_recalculada_negativa` counts cases where the recalculated value was also negative.
+  </Accordion>
+</AccordionGroup>
+
+## R14–R15: Near-Duplicate Transactions
+
+<AccordionGroup>
+  <Accordion title="R14 — System duplicate: same approved payment within 180 s → discard second" icon="server">
+    **Table:** transacciones  
+    **Decision:** descartar
+
+    When the same user, merchant, device, and amount appear in two approved transactions within 180 seconds, the second is a system-level duplicate — a client would not successfully pay twice for the same thing in three minutes. The second row is discarded.
+
+    Row count is `R14`.
+  </Accordion>
+
+  <Accordion title="R15 — Client retry: same rejected/pending payment within 180 s → keep and flag" icon="rotate-right">
+    **Table:** transacciones  
+    **Decision:** marcar
+
+    A repeated attempt on a rejected or pending payment within 180 seconds is a genuine re-try by the user and is kept. It is a velocity signal that the fraud model is designed to capture. The row is flagged with `flag_reintento = 1`.
+
+    Row count is `R15`.
+  </Accordion>
+</AccordionGroup>
+
+## R16–R17: Labeling and Data Leakage
+
+<Warning>
+  R16 does not mean unlabeled rows are legitimate transactions. Approximately 96% of rows in `transacciones.csv` have no analyst review. These rows are treated as legitimate *only for the purpose of computing metrics*, and that assumption is declared explicitly in the model documentation. Do not interpret model performance numbers as if the unlabeled set were a clean negative class.
+</Warning>
+
+<AccordionGroup>
+  <Accordion title="R16 — es_fraude empty (96% of rows) → mark as unlabeled, treat as legitimate for metrics" icon="tag-slash">
+    **Table:** transacciones  
+    **Decision:** marcar
+
+    Only about 4% of transactions have been reviewed by an analyst and carry a fraud label. The remaining 96% have `es_fraude` empty — not confirmed legitimate, just not reviewed. These rows receive `etiquetada = 0`. For training, they are treated as legitimate (class 0) with a reduced sample weight (`PESO_NO_REVISADAS = 1.0` vs. `PESO_FRAUDE = 20.0` for confirmed fraud). For metric computation they are treated as legitimate, which inflates precision estimates.
+
+    Row count (`R16`) is the number of unlabeled rows.
+  </Accordion>
+
+  <Accordion title="R17 — revisado_por_analista and motivo_bloqueo filled after the verdict → kept but excluded from model" icon="eye-slash">
+    **Table:** transacciones  
+    **Decision:** marcar
+
+    These two columns are populated by analysts after a transaction has been reviewed and a decision has been made. At inference time — when the model must decide in real time — these fields do not yet exist. Including them in the model would be a severe data leakage: the model would learn to predict fraud from information that reveals the answer.
+
+    The columns are kept in the treated CSV for the re-labeling workflow (analysts use them to update the fraud label set) but are explicitly excluded from `FEATURES` and never appear in `variables_modelo.csv`.
+
+    Row count (`R17`) is the number of rows with a non-null `motivo_bloqueo`.
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+  R17 is enforced structurally: `revisado_por_analista` and `motivo_bloqueo` are not in the `VARIABLES` or `FEATURES` lists in `preparar.py`. They cannot accidentally enter the model by being present in the data — they are never written to `variables_modelo.csv`.
+</Note>
+
+## R18–R19: Blocklist and Null Strategy
+
+<AccordionGroup>
+  <Accordion title="R18 — Blocklist whitespace and inactive entries → strip and exclude inactive" icon="list-check">
+    **Table:** lista_negra  
+    **Decision:** corregir
+
+    Blocklist `valor` fields may have leading or trailing whitespace that would prevent exact-match lookups. All values are stripped with `.str.strip()`.
+
+    Entries with `vigente = 0` are marked as inactive (`activa = False`) and excluded from the blocklist join. They remain in the treated CSV but do not contribute to `lista_negra_interna` or `lista_negra_dura` features. Only entries where the blocklist `fecha_alta` is on or before the transaction date contribute — future entries do not count, preserving the temporal integrity of the feature.
+
+    Row counts: `R18_espacios` (values with whitespace), `R18_dadas_de_baja` (inactive entries).
+  </Accordion>
+
+  <Accordion title="R19 — Nulls in model input columns → NOT imputed here; imputed in training" icon="circle-question">
+    **Tables:** model variables  
+    **Decision:** marcar
+
+    Null values in the 21 model features are left as nulls in `variables_modelo.csv`. They are not filled in `preparar.py`. Imputation happens inside `entrenar.py` using a `sklearn` `SimpleImputer` fitted **only on the training set**, then applied to validation and test sets. This prevents the test-set median from leaking into the imputed training values.
+
+    Each numeric null also receives a binary missing-indicator column (`missingindicator_<feature>`), so the model can learn separately that the value was absent. The imputer and scaler are serialized as `preprocesador.joblib` and travel with the ONNX model artifact — the same imputation logic runs at inference time.
+  </Accordion>
+</AccordionGroup>

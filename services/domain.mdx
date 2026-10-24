@@ -1,0 +1,202 @@
+---
+title: "Domain Service: Fraud Evaluation Business Logic"
+sidebarTitle: "Domain Service"
+description: "The domain service is the only component that reads and writes the database. It validates input, enriches transactions with user and device profiles, calls the inference service, and records every decision."
+---
+
+The domain service (`servicio-dominio`) is the orchestration layer of Guardián Centinela. It is the **only** component in the system that holds a connection pool to PostgreSQL. All other services are stateless and have no database credentials. When a transaction arrives, the domain service validates it, enriches it with data from the database, calls the inference microservice, applies a fallback policy if the inference service is unavailable, and writes a permanent audit record before returning a response.
+
+## POST /evaluar — code flow
+
+<Steps>
+  <Step title="Input validation">
+    FastAPI deserializes the request body into a `Transaccion` Pydantic model. Validation fails with HTTP 422 if any field is out of range or has the wrong type.
+
+    A dedicated validator enforces **PCI-DSS compliance (RNF5)**: if `tarjeta_enmascarada` contains a sequence of 13–19 consecutive digits (after stripping spaces and hyphens), the request is rejected immediately with a 422 error — a full PAN must never enter the system.
+
+    ```python
+    PAN_RE = re.compile(r"\d{13,19}")
+
+    @field_validator("tarjeta_enmascarada")
+    @classmethod
+    def sin_pan(cls, v):
+        if v and PAN_RE.search(v.replace(" ", "").replace("-", "")):
+            raise ValueError(
+                "Se recibió un número de tarjeta completo (PAN). "
+                "Solo se acepta el enmascarado ****NNNN"
+            )
+        return v
+    ```
+
+    The `pais_transaccion` field is also uppercased automatically to normalize two-letter ISO country codes.
+  </Step>
+  <Step title="Database reads">
+    Three queries run synchronously within a single pooled connection:
+
+    - **`perfil_usuario(cur, usuario_id)`** — reads `pais_usuario`, `segmento`, `verificado`, `telefono_verificado`, `nivel_kyc`, `dominio_desechable`, and `fecha_registro` from the `usuarios` table.
+    - **`perfil_dispositivo(cur, dispositivo_id)`** — reads `tipo_dispositivo`, `pais_disp`, and `emulador` from the `dispositivos` table. Returns `None` if no `dispositivo_id` was supplied.
+    - **`lista_negra(cur, t)`** — checks `ip`, `dispositivo_id`, `comercio_id`, and `tarjeta_enmascarada` against active blacklist entries. Returns two booleans (`dura`, `interna`) and a list of reason objects.
+
+    A `lista_negra_dura = True` result means a compliance-mandated block: regardless of what the model scores, the transaction will be blocked.
+  </Step>
+  <Step title="Build inference payload">
+    The service assembles a `TransaccionInput`-shaped JSON object, combining the raw transaction fields with the enrichment data retrieved from the database:
+
+    ```python
+    entrada_ia = {
+        "transaccion_id": tx_id,
+        "usuario_id": t.usuario_id,
+        "comercio_id": t.comercio_id,
+        "timestamp": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "monto": t.monto,
+        "moneda": t.moneda,
+        "canal": t.canal,
+        "pais_transaccion": t.pais_transaccion,
+        "mcc": int(t.mcc),
+        "usuario": usuario,         # from DB
+        "dispositivo": dispositivo, # from DB
+        "lista_negra_interna": interna,
+        "lista_negra_dura": dura,
+        # ... additional fields
+    }
+    ```
+  </Step>
+  <Step title="Call the inference service">
+    The domain service sends a synchronous `POST` to `{IA_URL}/predict` via `httpx` with a deadline of `IA_TIMEOUT_MS` milliseconds (default: 500 ms).
+
+    ```python
+    IA_URL = os.getenv("IA_URL", "http://gateway:8080/api/ia")
+    IA_TIMEOUT_S = float(os.getenv("IA_TIMEOUT_MS", "500")) / 1000
+
+    r = http.post(f"{IA_URL}/predict", json=entrada_ia)
+    r.raise_for_status()
+    ia = r.json()
+    decision = ia["decision"]
+    ```
+
+    The `IA_URL` points back through the gateway so that the gateway's round-robin load balancer distributes calls evenly across both IA replicas.
+
+    The `origen` field is set to `"regla_dura"` if the inference service itself flagged a hard rule (`ia.get("regla_aplicada")`) or if `dura` was already true from the blacklist check. Otherwise `origen` is `"modelo"`.
+  </Step>
+  <Step title="Fallback reservation policy">
+    If the inference call raises `httpx.TimeoutException`, `httpx.HTTPStatusError`, or any other `httpx.HTTPError`, the service falls back to `politica_reserva()` and sets `origen = "reserva"`. The failure reason is appended to the `razones` list for full auditability.
+  </Step>
+  <Step title="Persist the decision (RETURNING)">
+    Every evaluation, whether decided by the model or the fallback policy, is written to the `predicciones` table:
+
+    ```python
+    cur.execute(
+        """INSERT INTO predicciones
+               (transaccion_id, usuario_id, dispositivo_id, entrada, probabilidad,
+                decision, origen, razones, version_modelo, version_umbrales, latencia_ms)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           RETURNING prediccion_id, creado_utc""",
+        (tx_id, t.usuario_id, t.dispositivo_id, Jsonb(entrada_ia), prob,
+         decision, origen, Jsonb(razones), version_modelo, version_umbrales, round(lat_ms, 3))
+    )
+    ```
+
+    The `RETURNING` clause retrieves the auto-generated `prediccion_id` and `creado_utc` in the same round-trip, so the response body never needs a second query.
+  </Step>
+  <Step title="Return response">
+    The endpoint returns a JSON object that includes the decision, its origin, the fraud probability (if the model ran), explainability reasons, latency breakdown, and the persistence metadata:
+
+    ```json
+    {
+      "prediccion_id": 42,
+      "transaccion_id": "TXN-A1B2C3D4E5F6",
+      "decision": "aprobar",
+      "origen": "modelo",
+      "probabilidad_fraude": 0.03241,
+      "razones": [...],
+      "version_modelo": "v2.1.0",
+      "version_umbrales": "u1.0",
+      "usuario_conocido": true,
+      "latencia_ms": 87.34,
+      "desglose_ms": { "base_de_datos": 12.1, "ia": 71.4 },
+      "fecha_utc": "2025-01-15T14:23:01.123456+00:00"
+    }
+    ```
+  </Step>
+</Steps>
+
+## Input model — `Transaccion`
+
+| Field | Type | Constraints |
+|---|---|---|
+| `transaccion_id` | `str` (optional) | Max 40 chars; auto-generated as `TXN-<12 hex>` if absent |
+| `usuario_id` | `str` | 3–20 chars |
+| `comercio_id` | `str` | 2–20 chars |
+| `dispositivo_id` | `str` (optional) | Max 40 chars |
+| `monto` | `float` | `> 0`, `≤ 500,000,000` |
+| `moneda` | `"CLP"` \| `"USD"` | Literal |
+| `canal` | `"app"` \| `"web"` \| `"pos"` \| `"api"` | Literal |
+| `mcc` | `str` | Must match `^\d{4}$` |
+| `pais_transaccion` | `str` | Exactly 2 chars, auto-uppercased |
+| `ip` | `str` (optional) | — |
+| `tarjeta_enmascarada` | `str` (optional) | Must not contain a 13–19 digit sequence |
+| `intentos_previos_1h` | `int` (optional) | 0–100 |
+| `timestamp` | `datetime` (optional) | Defaults to `now(UTC)` if absent |
+
+## Fallback reservation policy
+
+When the inference service is unreachable or times out, `politica_reserva()` makes the decision. The behavior is controlled by the `POLITICA_RESERVA` environment variable:
+
+<CodeGroup>
+
+```python reglas (default)
+# monto_usd > 150 OR intentos >= 3 OR country != CL → revisar
+# else → aprobar
+if monto_usd > 150 or (t.intentos_previos_1h or 0) >= 3 or t.pais_transaccion != "CL":
+    return "revisar", [...]
+return "aprobar", [...]
+```
+
+```python aprobar
+# Always approve — use in development only
+return "aprobar", [{"tipo": "reserva", "factor": "politica_reserva", "descripcion": "aprobar todo"}]
+```
+
+```python bloquear
+# Always block — use when model is under maintenance
+return "bloquear", [{"tipo": "reserva", "factor": "politica_reserva", "descripcion": "bloquear todo"}]
+```
+
+</CodeGroup>
+
+<Warning>
+A hard blacklist hit (`dura=True`) always overrides the `POLITICA_RESERVA` setting. Even with `POLITICA_RESERVA=aprobar`, a compliance-mandated block is enforced before `politica_reserva()` checks the environment variable.
+</Warning>
+
+## Decision origin values
+
+The `origen` field in every prediction record tells you which path produced the decision:
+
+| Value | Meaning |
+|---|---|
+| `modelo` | The ONNX model ran and returned a score; no hard rule overrode it |
+| `regla_dura` | The model ran, but a hard blacklist rule forced the decision |
+| `reserva` | The inference service was unavailable; `politica_reserva()` decided |
+
+## Additional endpoints
+
+Beyond `/evaluar`, the domain service exposes several read-only endpoints useful for the front-end and audit workflows:
+
+| Endpoint | Description |
+|---|---|
+| `GET /health` | Executes `SELECT 1` against the DB pool; returns 503 if the pool is unavailable |
+| `GET /predicciones` | Last N predictions (default 20, max 200) |
+| `GET /predicciones/{transaccion_id}` | Full audit trail for a specific transaction (RF7) |
+| `GET /usuarios` | Sample users with a known device and merchant (for the demo front-end) |
+| `GET /resumen` | Row counts per table and decision breakdown by origin |
+
+## Resource limits
+
+| Resource | Limit |
+|---|---|
+| CPU | 1.00 core |
+| Memory | 256 MB |
+
+<Note>
+The domain service waits for both `db` (healthy) and `carga` (completed successfully) before starting. This ordering guarantee is declared in `compose.yaml` via `depends_on` conditions, so the schema and seed data are always present before the first request arrives.
+</Note>

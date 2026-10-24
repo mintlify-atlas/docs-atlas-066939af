@@ -1,0 +1,263 @@
+---
+title: "Monitor Guardián Centinela: Health, Latency, and Decisions"
+sidebarTitle: "Monitoring"
+description: "Health check endpoints, latency fields, decision audit trail, and operational queries for monitoring the Guardián Centinela fraud detection system in production."
+---
+
+Guardián Centinela is designed to be observable from the outside. Every service exposes a `/health` endpoint, every fraud evaluation response includes latency breakdowns, and the domain API provides audit endpoints that expose decision history and system summaries without requiring direct database access.
+
+## Health endpoints
+
+There are three health endpoints accessible through the gateway, each probing a different layer of the stack.
+
+### Gateway health
+
+```bash
+curl http://localhost:8080/health
+```
+
+```json
+{"status": "healthy", "servicio": "servicio-gateway"}
+```
+
+This endpoint is served directly by nginx without proxying to any upstream. A `200` response means the gateway process is alive and its configuration is loaded. Use this as the primary liveness check.
+
+### Domain service health
+
+```bash
+curl http://localhost:8080/api/dominio/health
+```
+
+The domain service tests its PostgreSQL connection on every call to this endpoint. If the database is unreachable, it returns `503`:
+
+```json
+{"status": "error", "detalle": "no se puede conectar a la base de datos"}
+```
+
+A `200` response confirms that the business logic layer and its persistence store are both operational.
+
+### Inference service health
+
+```bash
+curl http://localhost:8080/api/ia/health
+```
+
+The inference service verifies that the TensorFlow model is loaded and ready to serve predictions. A healthy response includes the active model version:
+
+```json
+{"status": "healthy", "version_modelo": "2.0.0+a3f1b2c"}
+```
+
+A `503` means the model has not finished loading (typical during the 20-second `start_period`) or failed to initialize. Check container logs if `503` persists beyond startup.
+
+<Note>
+With two IA replicas running, consecutive calls to `/api/ia/health` may return responses from different replicas. The `X-Upstream` response header identifies which replica served the request — see the [IA replica section](#ia-replica-identification) below.
+</Note>
+
+---
+
+## Latency tracking
+
+Every response from `POST /api/dominio/evaluar` includes a latency breakdown so you can distinguish database overhead from inference overhead:
+
+```json
+{
+  "transaccion_id": "txn_001",
+  "decision": "aprobar",
+  "probabilidad_fraude": 0.04,
+  "origen": "ia",
+  "version_modelo": "2.0.0+a3f1b2c",
+  "latencia_ms": 87,
+  "desglose_ms": {
+    "base_de_datos": 12,
+    "ia": 74
+  }
+}
+```
+
+| Field | Description |
+|---|---|
+| `latencia_ms` | Total wall-clock time from request receipt to response send |
+| `desglose_ms.base_de_datos` | Time spent reading/writing to PostgreSQL |
+| `desglose_ms.ia` | Time spent waiting for the inference service (0 when `origen=reserva`) |
+
+Track `latencia_ms` over time to detect model drift in serving performance. A sudden increase in `desglose_ms.ia` without a corresponding increase in `desglose_ms.base_de_datos` points to IA replica overload — consider scaling up replicas.
+
+---
+
+## Decision audit trail
+
+### Last N decisions
+
+```bash
+curl "http://localhost:8080/api/dominio/predicciones"
+```
+
+Returns the most recent fraud evaluation decisions stored in the database. Each record includes:
+
+```json
+[
+  {
+    "transaccion_id": "txn_001",
+    "usuario_id": "KP301626",
+    "decision": "aprobar",
+    "probabilidad_fraude": 0.04,
+    "origen": "ia",
+    "version_modelo": "2.0.0+a3f1b2c",
+    "latencia_ms": 87,
+    "timestamp": "2026-10-15T20:00:00Z"
+  }
+]
+```
+
+The `origen` field is particularly important for operational monitoring:
+
+| `origen` value | Meaning |
+|---|---|
+| `ia` | Decision made by the trained TensorFlow model |
+| `reserva` | IA was unavailable — decision made by the fallback policy (`POLITICA_RESERVA`) |
+| `reglas` | Decision made by the rule-based engine (when configured as primary) |
+
+<Warning>
+When `origen=reserva` appears in decisions, it means the IA service was unreachable or timed out (default timeout: 500 ms, configurable via `IA_TIMEOUT_MS`). A spike in `reserva` decisions should trigger an alert — check IA container logs and healthcheck status immediately.
+</Warning>
+
+### System summary
+
+```bash
+curl http://localhost:8080/api/dominio/resumen
+```
+
+Returns an overview of the system state: table row counts and a breakdown of decisions grouped by `(decision, origen)`:
+
+```json
+{
+  "totales": {
+    "transacciones": 15420,
+    "predicciones": 15420,
+    "usuarios": 1200,
+    "comercios": 340
+  },
+  "decisiones": [
+    {"decision": "aprobar",  "origen": "ia",      "cantidad": 14810},
+    {"decision": "revisar",  "origen": "ia",      "cantidad": 487},
+    {"decision": "bloquear", "origen": "ia",      "cantidad": 98},
+    {"decision": "aprobar",  "origen": "reserva", "cantidad": 25}
+  ]
+}
+```
+
+Use the `decisiones` breakdown to compute model vs. fallback ratios over time. A healthy system should show nearly all decisions with `origen=ia`. The `revisar` to `bloquear` ratio reflects threshold tuning in `servicio-ia/model/umbrales.json`.
+
+---
+
+## IA replica identification
+
+The nginx gateway adds an `X-Upstream` header to every proxied response, identifying which backend instance served the request:
+
+```bash
+curl -I http://localhost:8080/api/ia/health
+```
+
+```
+HTTP/1.1 200 OK
+X-Upstream: 172.18.0.5:8000
+```
+
+This is useful when debugging inconsistent responses across requests — if one replica has a stale model version or is in a degraded state, `X-Upstream` pinpoints which container to inspect.
+
+---
+
+## Container resource usage
+
+The resource limits in `compose.yaml` were derived from `docker stats` measurements. You can replicate those measurements live:
+
+```bash
+docker stats
+```
+
+Sample output under moderate load:
+
+```
+CONTAINER                    CPU %   MEM USAGE / LIMIT   MEM %
+equipoNN-gateway-1           0.2%    18MiB / 64MiB       28%
+equipoNN-front-1             0.0%    8MiB / 32MiB        25%
+equipoNN-dominio-1           1.4%    88MiB / 256MiB      34%
+equipoNN-ia-1                8.3%    310MiB / 512MiB     60%
+equipoNN-ia-2                7.1%    308MiB / 512MiB     60%
+equipoNN-carga-1             —       (exited)
+equipoNN-db-1                0.6%    42MiB / 256MiB      16%
+```
+
+If an `ia` container's memory usage approaches its 512 MB limit, that is an early warning of an OOM kill. Consider increasing `mem_limit` for `ia` in a local compose override file before the container is killed.
+
+---
+
+## Docker Compose healthcheck configuration
+
+The healthcheck parameters from `compose.yaml` set the expected recovery windows:
+
+| Service | Interval | Timeout | Retries | Start period | Max wait |
+|---|---|---|---|---|---|
+| `db` | 5s | 3s | 10 | — | ~50s |
+| `dominio` | 10s | 3s | 3 | 10s | ~40s |
+| `ia` | 10s | 3s | 3 | 20s | ~50s |
+| `front` | 10s | 3s | 3 | — | ~30s |
+| `gateway` | 10s | 3s | 3 | — | ~30s |
+
+The `ia` service has the longest `start_period` (20s) because TensorFlow model loading is the slowest initialization step in the stack. Healthchecks do not begin until after that window, so Docker will not mark the container as unhealthy during normal cold start.
+
+---
+
+## Log access
+
+<CodeGroup>
+```bash Business logic logs
+docker compose -p equipoNN logs -f dominio
+```
+
+```bash Inference logs
+docker compose -p equipoNN logs -f ia
+```
+
+```bash Gateway access logs
+docker compose -p equipoNN logs -f gateway
+```
+
+```bash Database logs
+docker compose -p equipoNN logs -f db
+```
+</CodeGroup>
+
+Use `dominio` logs to trace the full lifecycle of an evaluation request: PAN validation, IA call, fallback trigger, and database write. Use `ia` logs to inspect model input/output and TensorFlow warnings.
+
+### Nginx access log format
+
+The gateway logs in a custom format named `kipu` that includes upstream routing detail:
+
+| Field | Description |
+|---|---|
+| `remote_addr` | Client IP address |
+| `time` | Request timestamp |
+| `request` | HTTP method, path, and protocol |
+| `status` | HTTP status code returned to the client |
+| `upstream_addr` | IP and port of the backend that served the request |
+| `upstream_status` | HTTP status returned by the backend |
+| `request_time` | Total time to serve the request (seconds) |
+| `upstream_response_time` | Time waiting for the backend response (seconds) |
+
+The gap between `request_time` and `upstream_response_time` is the nginx overhead (connection setup, header parsing). Both values are also available in the `latencia_ms` and `desglose_ms` fields of the `/evaluar` response body for application-level analysis.
+
+---
+
+## Alerting recommendations
+
+Based on the system's observable signals, the following conditions are worth alerting on in a production environment:
+
+| Signal | Condition | Likely cause |
+|---|---|---|
+| `GET /api/ia/health` | Returns `503` for > 30s | IA replica crashed or model failed to load |
+| `origen=reserva` share | > 5% of recent decisions | IA timeout spike; check `IA_TIMEOUT_MS` and IA replica health |
+| `ia` container memory | > 90% of 512 MB limit | Model memory growth; increase `mem_limit` or investigate leak |
+| `desglose_ms.ia` p99 | > `IA_TIMEOUT_MS` (500ms) | IA overloaded; scale replicas with `--scale ia=N` |
+| `GET /api/dominio/health` | Returns `503` | PostgreSQL unreachable; check `db` container and `datos-pg` volume |

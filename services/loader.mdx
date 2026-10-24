@@ -1,0 +1,182 @@
+---
+title: "Data Loader Service: Idempotent Database Seeding"
+sidebarTitle: "Data Loader"
+description: "The loader service creates the PostgreSQL schema and bulk-loads treated CSV data on first start. It runs once and exits, is idempotent via ON CONFLICT DO NOTHING, and never duplicates rows."
+---
+
+The loader service (`servicio-carga`) is a one-shot job that bootstraps the system database. It creates the full PostgreSQL schema if it does not already exist, then bulk-loads the four reference tables from the treated CSV files produced by `datos/preparar.py`. Once all tables are loaded and the transaction is committed, the process exits with code 0. Docker Compose does not restart it (`restart: "no"`), and the domain service is configured to wait for it to complete successfully before accepting requests.
+
+## What it does
+
+<Steps>
+  <Step title="Wait for PostgreSQL to accept connections">
+    `conectar()` retries the connection up to 30 times with a 2-second pause between attempts. If the database is still not reachable after 60 seconds, the process exits with a non-zero code and compose logs the failure.
+  </Step>
+  <Step title="Apply the schema">
+    The full contents of `schema.sql` are executed in a single statement. Because every `CREATE TABLE` and `CREATE INDEX` uses `IF NOT EXISTS`, this step is safe to run against an already-initialized database — it produces no errors and makes no changes.
+
+    ```python
+    cur.execute(ESQUEMA.read_text(encoding="utf-8"))
+    ```
+  </Step>
+  <Step title="Load tables in dependency order">
+    Tables are loaded in an order that satisfies logical foreign-key dependencies: reference tables first, fact tables last.
+
+    ```
+    usuarios → dispositivos → lista_negra → transacciones
+    ```
+
+    The `predicciones` table is **not** seeded — it starts empty and is written exclusively by the domain service at runtime.
+  </Step>
+  <Step title="COPY → INSERT ON CONFLICT DO NOTHING">
+    For each table, the loader:
+
+    1. Creates a temporary staging table (`stg_<tabla>`) with the same schema, scoped to the current transaction.
+    2. Streams the CSV file into the staging table via the PostgreSQL `COPY` protocol (64 KB chunks).
+    3. Inserts from staging into the real table, skipping any row whose primary key already exists.
+
+    ```python
+    cur.execute(f"CREATE TEMP TABLE stg_{tabla} (LIKE {tabla} INCLUDING DEFAULTS) ON COMMIT DROP")
+    # ... COPY FROM STDIN ...
+    cur.execute(
+        f"INSERT INTO {tabla} ({cols}) SELECT {cols} FROM stg_{tabla} "
+        f"ON CONFLICT ({clave}) DO NOTHING"
+    )
+    ```
+
+    Progress is printed for each table: rows read, rows inserted, and rows already present.
+  </Step>
+  <Step title="Commit and exit">
+    A single `con.commit()` covers all four tables atomically. If any table fails, the entire transaction rolls back and no partial data is left in the database. The process exits with code 0 on success.
+  </Step>
+</Steps>
+
+## Tables and load order
+
+### `usuarios`
+
+The primary user profile table. Each row represents one registered account.
+
+| Column | Type | Notes |
+|---|---|---|
+| `usuario_id` | `TEXT PRIMARY KEY` | Natural key |
+| `pais_usuario` | `CHAR(2)` | ISO-3166-1 alpha-2 |
+| `segmento` | `TEXT` | CHECK: `persona`, `comercio_pequeno`, `comercio_grande` |
+| `verificado` | `REAL` | 0.0 or 1.0 |
+| `telefono_verificado` | `REAL` | 0.0 or 1.0 |
+| `nivel_kyc` | `REAL` | CHECK: 0–3 |
+| `dominio_desechable` | `REAL` | 0.0 or 1.0 |
+| `fecha_registro` | `DATE` | — |
+| `flag_fecha_registro_futura` | `BOOLEAN NOT NULL` | Set by `preparar.py` |
+
+### `dispositivos`
+
+One row per unique device. Loaded after `usuarios`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `dispositivo_id` | `TEXT PRIMARY KEY` | Natural key |
+| `tipo_dispositivo` | `TEXT` | CHECK: `android`, `ios`, `web`, `pos` |
+| `pais_disp` | `CHAR(2)` | ISO-3166-1 alpha-2 |
+| `emulador` | `REAL` | 0.0 or 1.0 |
+| `sistema_operativo` | `TEXT` | — |
+| `primera_vez_utc` | `TIMESTAMPTZ` | — |
+
+### `lista_negra`
+
+Blacklist entries. The **composite primary key** `(tipo, valor, fecha_alta)` allows the same entity to be blocked more than once on different dates.
+
+| Column | Type | Notes |
+|---|---|---|
+| `tipo` | `TEXT NOT NULL` | CHECK: `ip`, `dispositivo`, `comercio`, `tarjeta` |
+| `valor` | `TEXT NOT NULL` | The blocked value |
+| `fecha_alta` | `DATE NOT NULL` | Date the entry was added |
+| `activa` | `BOOLEAN NOT NULL` | Soft-delete flag |
+| `dura` | `BOOLEAN NOT NULL` | Compliance-mandated block (RF4) |
+
+An index on `(tipo, valor) WHERE activa` makes the real-time blacklist lookup by the domain service fast.
+
+### `transacciones`
+
+The historical transaction ledger — treated output from `datos/preparar.py`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `transaccion_id` | `TEXT PRIMARY KEY` | Natural key |
+| `ts_utc` | `TIMESTAMPTZ NOT NULL` | Normalized timestamp |
+| `monto_valor` | `NUMERIC(14,2) NOT NULL` | Parsed amount |
+| `moneda` | `CHAR(3)` | CHECK: `CLP`, `USD` |
+| `canal` | `TEXT NOT NULL` | — |
+| `flag_monto_negativo` | `BOOLEAN NOT NULL` | Data-quality flag |
+| `flag_monto_cero` | `BOOLEAN NOT NULL` | Data-quality flag |
+| `flag_reintento` | `BOOLEAN NOT NULL` | Data-quality flag |
+| `es_fraude` | `REAL` | `NULL` = unlabeled (does not imply legitimate) |
+
+### `predicciones` (not seeded — runtime only)
+
+Created by the schema but never touched by the loader. Written by the domain service for every decision (RF7, RNF7).
+
+```sql
+CREATE TABLE IF NOT EXISTS predicciones (
+    prediccion_id     BIGSERIAL PRIMARY KEY,
+    transaccion_id    TEXT NOT NULL,
+    usuario_id        TEXT,
+    dispositivo_id    TEXT,
+    entrada           JSONB NOT NULL,
+    probabilidad      DOUBLE PRECISION,
+    decision          TEXT NOT NULL CHECK (decision IN ('aprobar','revisar','bloquear')),
+    origen            TEXT NOT NULL CHECK (origen IN ('modelo','regla_dura','reserva')),
+    razones           JSONB NOT NULL,
+    version_modelo    TEXT,
+    version_umbrales  TEXT,
+    latencia_ms       DOUBLE PRECISION,
+    creado_utc        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_pred_tx    ON predicciones (transaccion_id);
+CREATE INDEX IF NOT EXISTS ix_pred_fecha ON predicciones (creado_utc DESC);
+```
+
+The `entrada` column stores the full JSON payload that was sent to the model, making every decision fully reproducible from the database alone (RF7). The PAN never appears in `entrada` — the domain service's PAN validator blocks it at the API boundary.
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://kipu:kipu@db:5432/kipu` | PostgreSQL connection string |
+| `DIR_DATOS` | `./datos` (relative to `carga.py`) | Directory containing the four treated CSV files |
+
+## Compose integration
+
+```yaml
+carga:
+  image: ghcr.io/ser-martinezs/servicio-carga:ep2
+  environment:
+    DATABASE_URL: postgresql://kipu:${POSTGRES_PASSWORD:-kipu_local}@db:5432/kipu
+  depends_on:
+    db: { condition: service_healthy }
+  restart: "no"
+  cpus: 0.50
+  mem_limit: 128m
+```
+
+The domain service declares:
+
+```yaml
+dominio:
+  depends_on:
+    db:    { condition: service_healthy }
+    carga: { condition: service_completed_successfully }
+```
+
+This ordering guarantee means the domain service will not start — and will not attempt any database query — until the loader has committed all four tables and exited cleanly.
+
+## Resource limits
+
+| Resource | Limit |
+|---|---|
+| CPU | 0.50 cores |
+| Memory | 128 MB |
+
+<Note>
+The `ON CONFLICT DO NOTHING` strategy makes re-runs completely safe. If you need to reload data after a schema change, drop and re-create the affected tables, then restart the loader container with `docker compose run --rm carga`. Rows that already exist will be skipped; new rows will be inserted. The `predicciones` table is never touched, so no decision history is lost.
+</Note>

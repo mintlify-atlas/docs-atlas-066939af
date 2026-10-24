@@ -1,0 +1,89 @@
+---
+title: "Guardián Centinela: Real-Time Fraud Detection for Kipu Pagos"
+sidebarTitle: "Introduction"
+description: "Guardián Centinela scores payment transactions for fraud in real time using a Neural Additive Model, delivering explainable approve/review/block decisions with full audit trail."
+---
+
+Guardián Centinela is the real-time fraud detection system for Kipu Pagos. Every payment transaction is scored within milliseconds, classified into one of three decisions, and permanently recorded for audit — before the funds ever move. The system was purpose-built to handle Kipu Pagos' production volume of approximately **200,000 transactions per day** at a real-world fraud rate of **~0.012%**, where catching each fraudulent transaction matters enormously while keeping false-positive blocks low enough that legitimate customers are never inconvenienced.
+
+## What Guardián Centinela Does
+
+When a payment is initiated, the domain service enriches the transaction with the user's profile, device history, and blacklist status from PostgreSQL, then forwards a structured payload to the inference service. The inference service runs the payload through a calibrated Neural Additive Model (NAM) exported as an ONNX graph and returns a fraud probability together with per-factor contribution scores. The domain service applies hard compliance rules on top, records the full decision row, and returns the final verdict to the caller — all within a 500 ms budget.
+
+<Note>
+  PAN (Primary Account Number) **never enters the system**. The `tarjeta_enmascarada` field accepts only a masked token in the format `****NNNN`. Any payload containing a 13–19 digit card number is rejected at the API boundary before any data is written or forwarded — satisfying requirement RNF5 and PCI-DSS cardholder data obligations.
+</Note>
+
+## The Three Decision Outcomes
+
+Every evaluated transaction receives exactly one of three decisions, stored in the `decision` field of the audit record:
+
+<CardGroup cols={3}>
+  <Card title="aprobar" icon="circle-check">
+    The fraud probability is below the review threshold. The transaction is cleared for processing with no further action required.
+  </Card>
+  <Card title="revisar" icon="magnifying-glass">
+    The fraud probability falls between the review and block thresholds. The transaction is queued for a human analyst. This zone is only active during analyst shift hours — **08:00–22:00 Chile time** — because transactions flagged overnight cannot be reviewed before settlement.
+  </Card>
+  <Card title="bloquear" icon="ban">
+    The fraud probability exceeds the block threshold, or a hard compliance rule (such as a blacklist match flagged as `dura = true`) mandates blocking regardless of the model score. The transaction is declined immediately.
+  </Card>
+</CardGroup>
+
+## Key Capabilities
+
+### Explainable Neural Additive Model
+
+The inference service runs a NAM: one small neural subnetwork per input factor, whose outputs are summed in logit space to produce the final probability (`logit = Σ contributions`). Because each factor's contribution is computed independently and summed, the per-factor scores are exact — not approximations — satisfying the explainability requirement (RT8 / RF2). Every response includes a `razones` array that lists each factor's contribution so analysts and compliance teams can understand exactly why a transaction was flagged.
+
+### Compliance Hard Rules
+
+Blacklist entries marked `dura = true` represent compliance obligations that override the model. When a device, IP, merchant, or masked card number matches such an entry, the decision is **bloquear** and the `origen` field is set to `regla_dura` regardless of the probability score. Internal blacklist hits are passed as features to the model rather than used as overrides.
+
+### Fallback / Reservation Policy
+
+If the inference service is unavailable (timeout, HTTP error, or unexpected response), the domain service applies the reservation policy controlled by the `POLITICA_RESERVA` environment variable. The policy is a risk-team decision (ADR-3) and has three modes: `reglas` (default — rule-based triage on amount, attempt count, and country), `aprobar` (pass all), or `bloquear` (block all). Decisions taken under fallback are recorded with `origen = reserva`.
+
+### Full Audit Trail
+
+Every evaluated transaction produces an immutable row in the `predicciones` table containing the full input payload (as JSONB), the fraud probability, the decision, the decision origin, all contributing reasons, the model version, the threshold version, and the end-to-end latency. The `GET /predicciones/{transaccion_id}` endpoint lets any authorized party reproduce exactly what model and data drove a particular decision (RF7).
+
+## Production Scale and Operating Context
+
+| Metric | Value |
+|---|---|
+| Transactions per day | ~200,000 |
+| Production fraud rate | ~0.012% (≈ 24 fraudulent tx/day) |
+| Analyst shift | 08:00–22:00 Chile time |
+| Analyst review capacity | ≤ 4,800 transactions/day |
+| IA timeout budget | 500 ms (configurable via `IA_TIMEOUT_MS`) |
+
+The review queue is sized to analyst capacity. The threshold-search algorithm in the training pipeline explicitly enforces that the number of flagged-for-review transactions per day stays within the 4,800-transaction limit, and that false positives do not exceed 15% of total blocks.
+
+## Quality Gate
+
+A model version is only promoted to the inference service image if it clears both metrics on the held-out **test set**, measured at production-weighted class proportions:
+
+| Metric | Minimum |
+|---|---|
+| ROC-AUC | ≥ 0.96 |
+| PR-AUC (production-weighted) | ≥ 0.45 |
+
+The thresholds are defined in `servicio-ia/calidad.json` and enforced by the training job (`entrenar.py`), which exits with code `1` and produces no model artifacts if either metric falls short — blocking the Docker image build automatically.
+
+## Explore the Docs
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run Guardián Centinela locally with Docker Compose and send your first evaluation request in under five minutes.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Deep dive into the five-service Docker topology, nginx gateway configuration, and request routing.
+  </Card>
+  <Card title="Data Overview" icon="database" href="/data/overview">
+    Understand how training data is prepared, split, and weighted to reflect real production fraud rates.
+  </Card>
+  <Card title="Evaluate API" icon="code" href="/api/evaluate">
+    Full reference for the `POST /evaluar` endpoint: request schema, response fields, and error codes.
+  </Card>
+</CardGroup>

@@ -1,0 +1,114 @@
+---
+title: "Data Pipeline: From Raw CSVs to Production Model"
+sidebarTitle: "Overview"
+description: "The Guardián Centinela data pipeline ingests four raw CSVs, applies 19 documented cleaning rules, engineers 21 features, and splits data chronologically for model training."
+---
+
+The Guardián Centinela data pipeline is a two-step process that transforms raw transaction records into a trained, calibrated, and exported fraud model. The first step (`preparar.py`) handles all data work: profiling, cleaning, integration, feature engineering, and chronological splitting. The second step (`entrenar.py`) consumes the output of the first and produces the model artifacts that the inference service loads at runtime.
+
+The two scripts are intentionally decoupled. `preparar.py` writes `variables_modelo.csv` with the split already baked in. `entrenar.py` never touches raw data and never re-splits — it only reads what `preparar.py` produced. This separation keeps data decisions auditable and reproducible independently of model decisions.
+
+## Input Files
+
+The pipeline expects four CSV files in the `datos/crudo/` directory.
+
+| File | Primary Key | Purpose |
+|---|---|---|
+| `transacciones.csv` | `transaccion_id` | Core payment events: amounts, timestamps, channels, geo-coordinates, IP, fraud labels |
+| `usuarios.csv` | `usuario_id` | User profiles: country, segment, KYC level, email domain, registration date |
+| `dispositivos.csv` | `dispositivo_id` | Device metadata: type, declared country, emulator flag, first-seen timestamp |
+| `lista_negra.csv` | *(none)* | Internal blocklist entries by IP, device ID, merchant ID, or masked card |
+
+## Pipeline Stages
+
+`preparar.py` runs six sequential stages. Every decision is written to `reporte_tratamiento.md` and `reporte_tratamiento.json` so the run is fully auditable.
+
+<Steps>
+  <Step title="Profiling">
+    Row counts, column types, null percentages, and duplicate counts are recorded for every input file **before and after** cleaning. This before/after snapshot is the baseline for verifying that cleaning rules did exactly what was intended and nothing else.
+  </Step>
+  <Step title="Cleaning">
+    Nineteen documented rules (R01–R19) are applied to transacciones, usuarios, dispositivos, and lista_negra. Each rule has a written rationale, a decision (`corregir`, `descartar`, or `marcar`), and a row count. See [Cleaning Rules](/data/cleaning-rules) for the full list.
+  </Step>
+  <Step title="Integration">
+    The three normalized tables are joined by their primary keys. All joins are **left joins on transactions** — a transaction without a user profile or device record is kept, not dropped. Missing profile fields become null values that the model preprocessor imputes at training and inference time. The integration report lists how many transactions had no matching user, no device ID, or a device ID not found in the device table.
+  </Step>
+  <Step title="Feature Engineering">
+    `construir_variables()` calculates the 21 model features from the joined, cleaned data. This function is **identical** to the one used by the inference service at runtime. See [Feature Engineering](/data/feature-engineering) for details.
+  </Step>
+  <Step title="Chronological Split">
+    Rows are sorted by `ts_utc` and cut into three consecutive slices: **60% train / 20% validation / 20% test**. The cut points are fixed here in `preparar.py`, before any model code runs. The pipeline halts if any split contains fewer than 10 fraud cases.
+  </Step>
+  <Step title="Outputs">
+    Treated CSVs are written for the loader service. `variables_modelo.csv` — containing the 21 features plus split label and target — is written for `entrenar.py`. A manifest with SHA-256 hashes of every input and output file is written alongside the human-readable report.
+  </Step>
+</Steps>
+
+## Output Files
+
+| File | Consumer | Contents |
+|---|---|---|
+| `datos/tratado/transacciones.csv` | Loader service | Cleaned transactions with all flag columns |
+| `datos/tratado/usuarios.csv` | Loader service | Normalized user profiles |
+| `datos/tratado/dispositivos.csv` | Loader service | Normalized device records |
+| `datos/tratado/lista_negra.csv` | Loader service | Cleaned blocklist with `activa` and `dura` flags |
+| `datos/tratado/variables_modelo.csv` | `entrenar.py` | 21 features + `split`, `y`, `etiquetada`, `ts_utc` |
+| `datos/tratado/variables.json` | `entrenar.py` | Feature names and calculation spec |
+| `datos/tratado/manifiesto.json` | Audit / CI | SHA-256 hashes of every input and output |
+| `datos/tratado/reporte_tratamiento.md` | Human review | Full cleaning, integration, and split report in Markdown |
+
+## How to Run
+
+Run `preparar.py` first; `entrenar.py` requires its output. Both scripts return exit code `0` on success and non-zero on failure — the CI job refuses to build the Docker image if either step fails.
+
+```bash
+python datos/preparar.py --entrada datos/crudo --salida datos/tratado
+python servicio-ia/entrenar.py --tratado datos/tratado --salida servicio-ia/model
+```
+
+Both scripts also accept explicit paths to override the defaults:
+
+```bash
+# Run with a custom data directory and model output path
+python datos/preparar.py \
+  --entrada /data/kipu/raw \
+  --salida  /data/kipu/processed
+
+python servicio-ia/entrenar.py \
+  --tratado /data/kipu/processed \
+  --salida  servicio-ia/model \
+  --version 2.1.0 \
+  --epocas  150
+```
+
+## No Training/Serving Skew
+
+`normalizar_transacciones()` and `construir_variables()` live in `datos/preparar.py` and are imported directly by the inference service. There is no copy-paste. If a cleaning or feature-engineering rule changes, it changes in one place and takes effect in both batch training and online inference on the next deploy.
+
+<Note>
+  The inference service uses `normalizar_transacciones()` and `construir_variables()` from `datos/preparar.py` at request time. Any change to those functions must be re-validated with a full `preparar.py → entrenar.py` run before deploying.
+</Note>
+
+## Why Chronological Splitting
+
+The 60/20/20 split is applied **by date, not at random**. In production the model always predicts future transactions using patterns learned from past ones. A random split would mix weeks together, leak future information into training, and produce an optimistically inflated evaluation score that does not reflect real-world performance.
+
+The split is fixed in `preparar.py` — before `entrenar.py` is ever invoked — to ensure that threshold selection on the validation set and final quality-gate measurement on the test set both use data that was genuinely unseen during training.
+
+<Warning>
+  Never re-run `preparar.py` with a different random seed or date range between a training run and its evaluation. The split boundaries are part of the experiment record.
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="Cleaning Rules" icon="broom" href="/data/cleaning-rules">
+    All 19 rules R01–R19 with rationale and affected row counts
+  </Card>
+  <Card title="Feature Engineering" icon="function" href="/data/feature-engineering">
+    The 21 model variables: sources, calculations, and excluded columns
+  </Card>
+  <Card title="Training" icon="brain" href="/data/training">
+    NAM architecture, quality gate, ONNX export, and CLI reference
+  </Card>
+</CardGroup>

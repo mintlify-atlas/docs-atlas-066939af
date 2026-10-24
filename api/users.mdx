@@ -1,0 +1,99 @@
+---
+title: "GET /usuarios — List Sample Users with Device Context"
+sidebarTitle: "GET /usuarios"
+description: "GET /api/dominio/usuarios returns a list of known users with their last-used device and merchant IDs — useful for populating test transaction payloads."
+---
+
+The `/usuarios` endpoint is designed for two audiences: the Guardián Centinela frontend (which needs real user records to populate its transaction simulator) and developers building or testing integrations against `POST /evaluar`. It returns user profiles enriched with a `dispositivo_id` and `comercio_id` pair drawn from that user's actual transaction history, giving you a set of realistic, self-consistent identifiers to use in test payloads.
+
+**Base URL (via gateway):** `GET http://localhost:8080/api/dominio/usuarios`
+
+## Query parameters
+
+<ParamField query="limit" type="integer">
+  Maximum number of users to return. Accepted range: `1`–`200`. Defaults to `20`. Results are ordered by `usuario_id` ascending.
+</ParamField>
+
+## Response — 200 OK
+
+An array of user context objects. Each entry combines columns from the `usuarios` table with a `(dispositivo_id, comercio_id)` pair sourced via a `JOIN LATERAL` subquery against the `transacciones` table — specifically the first transaction record for that user that has a non-null `comercio_id`.
+
+<ResponseField name="usuario_id" type="string">
+  The platform user identifier.
+</ResponseField>
+
+<ResponseField name="segmento" type="string">
+  The user's market segment as defined during onboarding (e.g. `"retail"`, `"pyme"`, `"corporativo"`).
+</ResponseField>
+
+<ResponseField name="nivel_kyc" type="integer">
+  Know-Your-Customer verification level. Higher values indicate more thorough identity verification.
+</ResponseField>
+
+<ResponseField name="dispositivo_id" type="string">
+  A device identifier from this user's transaction history. Guaranteed non-null because the lateral join requires at least one matching transaction row.
+</ResponseField>
+
+<ResponseField name="comercio_id" type="string">
+  A merchant identifier from the same transaction row as `dispositivo_id`. Use this together with `usuario_id` and `dispositivo_id` for a self-consistent test payload.
+</ResponseField>
+
+## How the lateral join works
+
+The query uses a `JOIN LATERAL` to efficiently find exactly one `(dispositivo_id, comercio_id)` pair per user without a full cross-join:
+
+```sql
+SELECT u.usuario_id, u.segmento, u.nivel_kyc, t.dispositivo_id, t.comercio_id
+FROM usuarios u
+JOIN LATERAL (
+    SELECT dispositivo_id, comercio_id
+    FROM transacciones x
+    WHERE x.usuario_id = u.usuario_id
+      AND x.comercio_id IS NOT NULL
+    LIMIT 1
+) t ON true
+ORDER BY u.usuario_id
+LIMIT %s
+```
+
+Only users who have at least one transaction with a non-null `comercio_id` are returned. Users with no transaction history are excluded.
+
+## Example
+
+<CodeGroup>
+
+```bash cURL
+curl -s "http://localhost:8080/api/dominio/usuarios?limit=3"
+```
+
+```json Response
+[
+  {
+    "usuario_id": "USR-00001",
+    "segmento": "retail",
+    "nivel_kyc": 2,
+    "dispositivo_id": "DEV-F9A341",
+    "comercio_id": "COM-0014"
+  },
+  {
+    "usuario_id": "USR-00002",
+    "segmento": "pyme",
+    "nivel_kyc": 3,
+    "dispositivo_id": "DEV-C7B812",
+    "comercio_id": "COM-0055"
+  },
+  {
+    "usuario_id": "USR-00003",
+    "segmento": "retail",
+    "nivel_kyc": 1,
+    "dispositivo_id": "DEV-A1B2C3",
+    "comercio_id": "COM-0081"
+  }
+]
+```
+
+</CodeGroup>
+
+<Tip>
+  Use this endpoint to get a ready-made set of valid identifiers before calling `POST /evaluar`. Take any row and copy `usuario_id`, `dispositivo_id`, and `comercio_id` directly into your transaction payload — all three values are guaranteed to exist in the database and will resolve to real user and device profiles, giving you a richer and more realistic fraud score response.
+</Tip>

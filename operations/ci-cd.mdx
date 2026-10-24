@@ -1,0 +1,356 @@
+---
+title: "CI/CD Pipelines: Build, Test, Train, and Publish"
+sidebarTitle: "CI/CD"
+description: "Five GitHub Actions workflows — one per service — that run data treatment, model training, unit tests, Docker image builds, and GHCR publication on every PR and push to main."
+---
+
+Every service in Guardián Centinela has its own GitHub Actions workflow that enforces a build-test-publish contract: nothing reaches GHCR unless it has passed all tests, and no release tag is re-built from source — it simply re-tags the already-verified image from the corresponding `main` commit.
+
+## Overview
+
+The five workflow files map one-to-one with the services declared in `compose.yaml`:
+
+| Workflow file | Service | Timeout |
+|---|---|---|
+| `ia.yml` | `servicio-ia` | 30 min |
+| `dominio.yml` | `servicio-dominio` | 20 min |
+| `carga.yml` | `servicio-carga` | 20 min |
+| `gateway.yml` | `servicio-gateway` | 20 min |
+| `front.yml` | `servicio-front` | 20 min |
+
+All five workflows share the same trigger and branching strategy:
+
+```yaml
+on:
+  pull_request:
+    branches: [dev, main]   # build + test only — never publishes
+  push:
+    branches: [main]        # build + test + publish sha-<commit> and latest
+  push:
+    tags: [ep2]             # re-tag only — no rebuild
+```
+
+### Concurrency and cancellation
+
+Each workflow uses a per-service, per-ref concurrency group. On pull requests, any in-progress run is cancelled when a new commit is pushed, keeping CI feedback fast:
+
+```yaml
+concurrency:
+  group: ia-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+```
+
+Push-to-main runs are **never** cancelled — a publish in progress always completes.
+
+### GHCR authentication
+
+All workflows authenticate to GHCR with the built-in `GITHUB_TOKEN`. No additional repository secrets are needed:
+
+```yaml
+- uses: docker/login-action@v3
+  with:
+    registry: ghcr.io
+    username: ${{ github.actor }}
+    password: ${{ secrets.GITHUB_TOKEN }}
+```
+
+### The `:ep2` release tag
+
+Pushing the `ep2` tag to the repository triggers the `publicar-ep2` job in all five workflows. This job:
+
+1. Verifies that the tagged commit is an ancestor of `main` (tags on feature branches are rejected).
+2. Looks up the already-published `sha-<short>` image for that commit in GHCR.
+3. Uses `docker buildx imagetools create` to add the `:ep2` alias — **no image is rebuilt**.
+
+```bash
+docker buildx imagetools create \
+  -t "ghcr.io/ser-martinezs/servicio-ia:ep2" \
+  "ghcr.io/ser-martinezs/servicio-ia:sha-<short>"
+```
+
+This guarantees that the `:ep2` image is byte-for-byte identical to the one that passed all tests on `main`.
+
+---
+
+## IA pipeline (`ia.yml`) — detailed walkthrough
+
+The IA workflow is the most complex because it must train and evaluate a TensorFlow model before building the container image.
+
+### 1. Python setup and dependency installation
+
+The workflow pins Python to `3.11` — the same version used inside the `python:3.11-slim` base image — and caches pip across runs using both `requirements-ci.txt` (CI tooling) and `servicio-ia/requirements.txt` (service dependencies) as cache keys:
+
+```yaml
+- uses: actions/setup-python@v5
+  with:
+    python-version: "3.11"
+    cache: pip
+    cache-dependency-path: |
+      requirements-ci.txt
+      servicio-ia/requirements.txt
+```
+
+### 2. Data treatment
+
+Raw data in `datos/crudo/` is never committed in a treated form. The pipeline always regenerates it from scratch:
+
+```bash
+python datos/preparar.py --entrada datos/crudo --salida datos/tratado
+```
+
+Followed immediately by treatment-level tests:
+
+```bash
+python -m pytest datos/ -q
+```
+
+These tests assert that the treated dataset has no duplicates and no nulls in key columns.
+
+### 3. Model training and the quality gate
+
+The training script `servicio-ia/entrenar.py` writes the model artefacts to `servicio-ia/model/` and evaluates it against the thresholds defined in `servicio-ia/calidad.json`:
+
+```json
+{
+  "roc_auc_min": 0.96,
+  "pr_auc_prod_min": 0.45,
+  "fraudes_prueba_min": 20
+}
+```
+
+If the trained model fails to meet these thresholds, the script exits with a non-zero code and the workflow halts — the Docker image is **never built**. Exit codes map to specific failure reasons:
+
+| Exit code | Meaning |
+|---|---|
+| `1` | Metric on the test set did not reach the threshold in `calidad.json` |
+| `2` | Invalid data or missing files in `datos/tratado/` |
+| `3` | TensorFlow not available in the environment |
+| other | Unexpected error |
+
+The workflow shell block maps each code to a human-readable GitHub Actions error annotation:
+
+```bash
+python servicio-ia/entrenar.py \
+  --tratado datos/tratado --salida servicio-ia/model \
+  --version "2.0.0+${GITHUB_SHA::7}" \
+|| {
+  codigo=$?
+  case $codigo in
+    1) motivo="la métrica sobre PRUEBA no alcanza el umbral de servicio-ia/calidad.json" ;;
+    2) motivo="datos inválidos o faltan archivos de datos/tratado" ;;
+    3) motivo="TensorFlow no está disponible en el entorno" ;;
+    *) motivo="error inesperado (código $codigo)" ;;
+  esac
+  echo "::error title=Entrenamiento falló::$motivo"
+  exit $codigo
+}
+```
+
+### 4. Service-level tests
+
+After a successful training run, the service tests are executed against the freshly trained model artefacts in `servicio-ia/model/`:
+
+```bash
+python -m pytest servicio-ia/ -q
+```
+
+These tests include API/training parity checks to confirm that the model the service will load at runtime is the same one evaluated by the quality gate.
+
+### 5. Artifact upload
+
+Training reports are uploaded on every run — including failures — with a 14-day retention:
+
+```yaml
+- uses: actions/upload-artifact@v4
+  with:
+    name: reportes-ia-${{ github.sha }}
+    retention-days: 14
+    if-no-files-found: ignore
+    path: |
+      datos/tratado/reporte_tratamiento.md
+      datos/tratado/reporte_tratamiento.json
+      datos/tratado/manifiesto.json
+      servicio-ia/reporte_entrenamiento.json
+      servicio-ia/model/metadata.json
+      servicio-ia/model/umbrales.json
+```
+
+<Tip>
+If training fails in CI, download the `reportes-ia-<sha>` artifact from the Actions run summary. `reporte_entrenamiento.json` contains per-metric values, and `metadata.json` records the model version and training timestamp. This is the fastest way to diagnose whether a threshold is genuinely not met or whether the training data changed unexpectedly.
+</Tip>
+
+### 6. Docker image build
+
+The image is built for `linux/amd64` only and loaded into the local Docker daemon (not pushed yet):
+
+```yaml
+- uses: docker/build-push-action@v6
+  with:
+    context: .
+    file: servicio-ia/Dockerfile
+    platforms: linux/amd64
+    load: true
+    tags: servicio-ia:ci
+    labels: ${{ steps.meta.outputs.labels }}
+```
+
+OCI labels including `org.opencontainers.image.revision` (the full commit SHA) are embedded in the image via `docker/metadata-action`.
+
+### 7. Smoke test
+
+The built image is started and subjected to two checks before any publication can happen:
+
+**Health check** — polls `/health` every 2 seconds for up to 30 seconds:
+
+```bash
+for _ in $(seq 1 30); do
+  curl -fsS http://localhost:8000/health >/dev/null 2>&1 && break
+  sleep 2
+done
+curl -fsS http://localhost:8000/health || { docker logs ia-smoke; exit 1; }
+```
+
+**Prediction check** — POSTs a minimal transaction payload and validates the response schema:
+
+```bash
+curl -fsS -X POST http://localhost:8000/predict \
+  -H 'content-type: application/json' \
+  -d '{"transaccion_id": "smoke_001", "usuario_id": "usr_smoke",
+       "comercio_id": "com_smoke", "timestamp": "2026-10-15T20:00:00Z",
+       "monto": 10000, "canal": "app", "pais_transaccion": "CL", "mcc": 5411}'
+```
+
+The response is validated in Python:
+
+```python
+assert r["decision"] in ("aprobar", "revisar", "bloquear")
+assert 0 <= r["probabilidad_fraude"] <= 1
+assert r["version_modelo"]
+```
+
+Only after both checks pass does the workflow proceed to publication.
+
+### 8. Publication (push to main only)
+
+Images are never pushed on pull requests. On a merge to `main`, the same `servicio-ia:ci` image is tagged and pushed:
+
+```
+ghcr.io/ser-martinezs/servicio-ia:sha-<7-char-sha>
+ghcr.io/ser-martinezs/servicio-ia:latest
+```
+
+---
+
+## Domain pipeline (`dominio.yml`)
+
+The domain pipeline tests the business logic service, including its interaction with PostgreSQL.
+
+### PostgreSQL service container
+
+A real PostgreSQL 16 instance is spun up as a GitHub Actions service container, ensuring tests run against the same database engine used in production:
+
+```yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    env: { POSTGRES_DB: kipu, POSTGRES_USER: kipu, POSTGRES_PASSWORD: kipu }
+    ports: ["5432:5432"]
+    options: --health-cmd "pg_isready -U kipu" --health-interval 5s --health-retries 10
+```
+
+### Database seed and domain tests
+
+Before running domain tests, the workflow seeds the test database using the same steps executed by `servicio-carga` in the compose stack:
+
+```bash
+python datos/preparar.py --entrada datos/crudo --salida datos/tratado
+DIR_DATOS=datos/tratado python servicio-carga/carga.py
+python -m pytest servicio-dominio/ -q
+```
+
+The domain tests cover: API contract validation, PAN rejection rules, the `/evaluar` endpoint persisting predictions, and the fallback policy when IA is unreachable.
+
+### Smoke test
+
+The smoke test starts `servicio-dominio:ci` with `IA_URL=http://localhost:9` (a port with no listener) to deliberately force the IA timeout:
+
+```bash
+docker run -d --name dominio-smoke --network host \
+  -e DATABASE_URL="$DATABASE_URL" \
+  -e IA_URL=http://localhost:9 \
+  "${IMAGEN}:ci"
+```
+
+After verifying `/health`, it calls `/evaluar` and asserts that the response has `origen == "reserva"` — confirming the fallback policy is active and the service degrades gracefully.
+
+---
+
+## Carga pipeline (`carga.yml`)
+
+The carga pipeline verifies that the database seed script is idempotent — running it twice against a real PostgreSQL instance must not insert duplicate rows:
+
+```bash
+# First run
+docker run --rm --network host -e DATABASE_URL="$DATABASE_URL" "${IMAGEN}:ci"
+
+# Second run — must report 0 rows inserted
+docker run --rm --network host -e DATABASE_URL="$DATABASE_URL" "${IMAGEN}:ci" \
+  | tee /tmp/segunda.txt
+grep -q "transacciones  leídas= *[0-9]*  insertadas= *0" /tmp/segunda.txt \
+  || { echo "::error::la segunda carga insertó filas: no es idempotente"; exit 1; }
+```
+
+This mirrors the `ON CONFLICT DO NOTHING` behaviour relied on by the compose deployment.
+
+---
+
+## Gateway pipeline (`gateway.yml`)
+
+The gateway is an nginx image with no Python test suite. Its pipeline focuses on configuration validity and HTTP behaviour:
+
+1. **Config test** — runs `nginx -t` inside the built image to catch syntax errors before deployment.
+2. **Health check** — polls `GET /health` and asserts `200`.
+3. **503 contract** — asserts that `GET /api/ia/health` returns `503` (not a hang or HTML error) when upstream services are absent.
+
+---
+
+## Front pipeline (`front.yml`)
+
+The front pipeline builds the static frontend image and asserts that:
+
+1. `GET /health` returns `200`.
+2. `GET /` returns HTML containing the string `Guardián Centinela`.
+3. `GET /` references `/api/dominio` — confirming the API base URL is correctly embedded in the build.
+
+---
+
+## Pipeline summary
+
+<CodeGroup>
+```yaml ia.yml triggers
+on:
+  pull_request:
+    branches: [dev, main]   # treatment + training + tests + build smoke (no push)
+  push:
+    branches: [main]        # + push sha-<short> and :latest to GHCR
+    tags: [ep2]             # re-tag sha-<short> as :ep2 (no rebuild)
+```
+
+```yaml dominio.yml / carga.yml triggers
+on:
+  pull_request:
+    branches: [dev, main]   # seed DB + tests + build smoke (no push)
+  push:
+    branches: [main]        # + push sha-<short> and :latest to GHCR
+    tags: [ep2]             # re-tag as :ep2 (no rebuild)
+```
+
+```yaml gateway.yml / front.yml triggers
+on:
+  pull_request:
+    branches: [dev, main]   # build + smoke test (no push)
+  push:
+    branches: [main]        # + push sha-<short> and :latest to GHCR
+    tags: [ep2]             # re-tag as :ep2 (no rebuild)
+```
+</CodeGroup>
